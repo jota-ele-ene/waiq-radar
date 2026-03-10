@@ -15,6 +15,8 @@ Variables de entorno opcionales extra:
   SAVE_RAW_RESPONSES=1   guarda respuestas crudas de Claude en output/raw/
   RADAR_JSON_PATH        ruta al JSON para publish-only (alternativa a --json)
 """
+from dotenv import load_dotenv
+load_dotenv()
 
 import os, re, sys, json, time, smtplib, urllib.request, argparse
 from datetime import datetime, timezone, timedelta
