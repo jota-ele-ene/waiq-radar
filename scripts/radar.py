@@ -291,7 +291,8 @@ def md_noticia(n, fecha, img_path, lang):
         f"topics:\n{yml_list(topics)}\nareas:\n{yml_list(areas)}\n"
         f'categories:\n  - "Radar"\nsource: "{n.get("source","")}"\n'
         f'url_original: "{n.get("url","")}"\nbutton_label: "{btn}"\n'
-        f'{"image: \\"" + img + "\\"" if img else "# image: \\"\\""}' + "\n---\n\n"
+        img_line = f'image: "{img}"' if img else '# image: ""'
+        f"{img_line}\n---\n\n"
         f"{desc}\n\n**{btn}:** [{n.get('source','')}]({n.get('url','')})\n"
     )
 
@@ -309,7 +310,8 @@ def md_articulo(art, fecha, img_path, lang):
         f'description: "{desc[:200].replace(chr(34),chr(39))}"\n'
         f"topics:\n{yml_list(topics)}\nareas:\n{yml_list(areas)}\n"
         f'categories:\n  - "Radar"\n  - "Opinion"\nauthor: "{OPINION_AUTHOR}"\n'
-        f'{"image: \\"" + img + "\\"" if img else "# image: \\"\\""}' + "\n---\n\n"
+        img_line = f'image: "{img}"' if img else '# image: ""'
+        f"{img_line}\n---\n\n"
         f"{body}\n"
     )
 
