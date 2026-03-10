@@ -2,15 +2,23 @@ name: WAIQ Radar
 
 on:
   schedule:
-    - cron: '0 7 * * 1'   # Lunes
-    - cron: '0 7 * * 4'   # Jueves
+    - cron: '0 7 * * 1'   # Lunes 7:00 UTC
+    - cron: '0 7 * * 4'   # Jueves 7:00 UTC
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Dry run (no push ni email)'
+      mode:
+        description: 'Modo de ejecución'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full           # busca + publica + email
+          - fetch-only     # busca + email + JSON (sin GitHub)
+          - publish-only   # carga JSON artifact + publica + email
+      json_artifact_id:
+        description: 'ID del artifact con el JSON (solo para publish-only)'
         required: false
-        default: 'false'
-        type: boolean
+        default: ''
 
 jobs:
   radar:
@@ -25,22 +33,41 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          #cache: 'pip'
 
       - name: Instalar dependencias
-        run: pip install anthropic PyGithub
+        run: pip install -r requirements.txt
 
-      - name: Ejecutar WAIQ Radar
+      # ── Solo para publish-only: descargar el JSON guardado previamente ──
+      - name: Descargar JSON artifact (publish-only)
+        if: ${{ github.event.inputs.mode == 'publish-only' && github.event.inputs.json_artifact_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: radar-json-${{ github.event.inputs.json_artifact_id }}
+          path: ./artifacts
+
+      - name: Ejecutar Radar
         env:
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN:        ${{ secrets.WAIQ_GITHUB_TOKEN }}
-          GITHUB_REPO:         ${{ secrets.WAIQ_REPO }}
-          HUGO_BASE_URL:       ${{ secrets.HUGO_BASE_URL }}
-          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_RECIPIENTS:    ${{ secrets.EMAIL_RECIPIENTS }}
-          DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:       ${{ secrets.WAIQ_GITHUB_TOKEN }}
+          GITHUB_REPO:        ${{ secrets.GITHUB_REPO }}
+          HUGO_BASE_URL:      ${{ secrets.HUGO_BASE_URL }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENTS:   ${{ secrets.EMAIL_RECIPIENTS }}
+          # En schedule siempre "full"; en manual usa el input
+          RADAR_MODE:         ${{ github.event.inputs.mode || 'full' }}
+          RADAR_JSON_PATH:    ${{ github.event.inputs.mode == 'publish-only' && './artifacts/radar_*.json' || '' }}
+          OUTPUT_DIR:         ./output
         run: python scripts/radar.py
+
+      # ── Guardar el JSON como artifact (fetch-only y full) ──
+      - name: Subir JSON como artifact
+        if: ${{ github.event.inputs.mode != 'publish-only' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-json-${{ github.run_id }}
+          path: ./output/radar_*.json
+          retention-days: 7
 
       - name: Notificar fallo
         if: failure()
@@ -53,4 +80,4 @@ jobs:
           to: ${{ secrets.EMAIL_RECIPIENTS }}
           from: ${{ secrets.GMAIL_USER }}
           subject: "⚠️ WAIQ Radar — Fallo (${{ github.run_id }})"
-          body: "Revisa los logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body: "Pipeline fallido. Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
