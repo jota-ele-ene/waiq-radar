@@ -34,7 +34,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN:        ${{ secrets.WAIQ_GITHUB_TOKEN }}
-          GITHUB_REPO:         ${{ secrets.GITHUB_REPO }}
+          GITHUB_REPO:         ${{ secrets.WAIQ_REPO }}
           HUGO_BASE_URL:       ${{ secrets.HUGO_BASE_URL }}
           GMAIL_USER:          ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
