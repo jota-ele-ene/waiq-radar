@@ -1,0 +1,56 @@
+name: WAIQ Radar
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Lunes
+    - cron: '0 7 * * 4'   # Jueves
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no push ni email)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install anthropic PyGithub
+
+      - name: Ejecutar WAIQ Radar
+        env:
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:        ${{ secrets.WAIQ_GITHUB_TOKEN }}
+          GITHUB_REPO:         ${{ secrets.GITHUB_REPO }}
+          HUGO_BASE_URL:       ${{ secrets.HUGO_BASE_URL }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENTS:    ${{ secrets.EMAIL_RECIPIENTS }}
+          DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/radar.py
+
+      - name: Notificar fallo
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          to: ${{ secrets.EMAIL_RECIPIENTS }}
+          from: ${{ secrets.GMAIL_USER }}
+          subject: "⚠️ WAIQ Radar — Fallo (${{ github.run_id }})"
+          body: "Revisa los logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
