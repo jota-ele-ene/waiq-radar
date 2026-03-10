@@ -65,13 +65,14 @@ WAIQ_CONTEXT = (
 
 cost_log: list[dict] = []
 
+
 def registrar_coste(llamada, model, usage, n_searches=0):
     p = PRICING.get(model, {"input": 3.00, "output": 15.00, "search": 10.00})
     input_tk  = getattr(usage, "input_tokens",  0)
     output_tk = getattr(usage, "output_tokens", 0)
-    cost_in     = (input_tk   / 1_000_000) * p["input"]
-    cost_out    = (output_tk  / 1_000_000) * p["output"]
-    cost_search = (n_searches / 1_000)     * p["search"]
+    cost_in     = (input_tk  / 1_000_000) * p["input"]
+    cost_out    = (output_tk / 1_000_000) * p["output"]
+    cost_search = (n_searches / 1_000)    * p["search"]
     cost_total  = cost_in + cost_out + cost_search
     entry = {
         "llamada": llamada, "model": model,
@@ -85,16 +86,18 @@ def registrar_coste(llamada, model, usage, n_searches=0):
     print(f"   💰 {llamada}: {input_tk:,}in + {output_tk:,}out{srch_str} = ${cost_total:.4f}")
     return entry
 
+
 def contar_searches(response):
     return sum(
         1 for b in response.content
         if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "web_search"
     )
 
+
 def imprimir_resumen_costes():
     total     = sum(e["cost_total"]   for e in cost_log)
     total_in  = sum(e["input_tokens"] for e in cost_log)
-    total_out = sum(e["output_tokens"]for e in cost_log)
+    total_out = sum(e["output_tokens"] for e in cost_log)
     total_sr  = sum(e["n_searches"]   for e in cost_log)
     sep = "─" * 62
     print(f"\n{sep}")
@@ -111,8 +114,10 @@ def imprimir_resumen_costes():
     print(f"  {'TOTAL':<26} {'':<12} {total_in:>7,} {total_out:>6,} {total_sr:>5} {total:>8.4f}")
     print(sep)
     print(f"\n  💵  Coste esta ejecución : ${total:.4f} USD")
-    print(f"  📅  Coste anual (×104)   : ${total * 104:.2f} USD\n")
+    print(f"  📅  Coste anual (×104)   : ${total * 104:.2f} USD")
+    print(f"{sep}\n")
     return total
+
 
 # ─────────────────────────────────────────────────────────────
 # 1. BÚSQUEDA
@@ -121,6 +126,7 @@ def imprimir_resumen_costes():
 def buscar_noticias(client):
     print("📡 Buscando noticias WAIQ...")
     desde = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+
     prompt = (
         f"Eres editor del radar WAIQ. Contexto: {WAIQ_CONTEXT}\n\n"
         f"Busca noticias desde {desde} sobre: regulación/gobernanza IA (EU AI Act, políticas "
@@ -134,22 +140,27 @@ def buscar_noticias(client):
         f"Devuelve SOLO JSON sin backticks:\n"
         f'{{\"noticias\":[{{...}},...]}}\n\nSelecciona 8-10 noticias de calidad.'
     )
+
     resp = client.messages.create(
         model=MODEL_SEARCH,
         max_tokens=3500,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         messages=[{"role": "user", "content": prompt}],
     )
+
     n_searches = contar_searches(resp)
     registrar_coste("buscar_noticias", MODEL_SEARCH, resp.usage, n_searches)
+
     text  = "".join(b.text for b in resp.content if hasattr(b, "text"))
     text  = re.sub(r"```json|```", "", text).strip()
     match = re.search(r'\{[\s\S]*\}', text)
     if not match:
         raise ValueError("JSON no encontrado en respuesta de búsqueda")
+
     noticias = json.loads(match.group()).get("noticias", [])
     print(f"   ✓ {len(noticias)} noticias · {n_searches} búsquedas")
     return noticias
+
 
 # ─────────────────────────────────────────────────────────────
 # 2. ARTÍCULO DE OPINIÓN
@@ -170,7 +181,7 @@ def generar_articulo(client, noticias):
         f"Usa subtítulos. Cita fuentes naturalmente.\n\n"
         f"Devuelve SOLO JSON sin backticks:\n"
         f'{{\"title_en\":\"...\",\"title_es\":\"...\",\"slug\":\"slug-kebab\",'
-        f'\"description_en\":\"...(max 155 chars)\",\"description_es\":\"...(max 155 chars)\",'
+        f'\"description_en\":\"...\",\"description_es\":\"...\",'
         f'\"tags_en\":[],\"tags_es\":[],\"areas\":[],\"topics\":[],'
         f'\"body_en\":\"...markdown...\",\"body_es\":\"...markdown...\"}}'
     )
@@ -187,6 +198,7 @@ def generar_articulo(client, noticias):
     art = json.loads(match.group())
     print(f"   ✓ «{art['title_en']}»")
     return art
+
 
 # ─────────────────────────────────────────────────────────────
 # 3. JSON INTERMEDIO
@@ -206,6 +218,7 @@ def guardar_json(noticias, articulo, fecha):
     print(f"   ✓ JSON: {p}")
     return str(p)
 
+
 def cargar_json(path):
     print(f"📂 Cargando {path}...")
     d = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -213,6 +226,7 @@ def cargar_json(path):
         cost_log.extend(d["costes"])
     print(f"   ✓ {len(d['noticias'])} noticias · «{d['articulo']['title_en']}»")
     return d["noticias"], d["articulo"], d.get("fecha", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
 
 # ─────────────────────────────────────────────────────────────
 # 4. IMÁGENES
@@ -232,9 +246,10 @@ def descargar_imagen(url, slug):
         print(f"   ⚠ Imagen no descargable ({e})")
         return None
 
+
 def svg_fallback(title, topic):
-    c  = {"ai": "#6366f1", "web3": "#10b981", "quantum": "#f59e0b"}.get(topic, "#6366f1")
-    w  = title.split()
+    c   = {"ai": "#6366f1", "web3": "#10b981", "quantum": "#f59e0b"}.get(topic, "#6366f1")
+    w   = title.split()
     l1, l2 = " ".join(w[:6]), " ".join(w[6:12])
     l2t = (f'<text x="400" y="310" font-family="system-ui" font-size="26" '
            f'font-weight="600" fill="white" text-anchor="middle">{l2}</text>') if l2 else ""
@@ -251,6 +266,7 @@ def svg_fallback(title, topic):
     )
     return "svg", svg.encode("utf-8")
 
+
 def preparar_imagen(noticia, slug):
     r = descargar_imagen(noticia.get("image_url"), slug)
     if r:
@@ -259,6 +275,7 @@ def preparar_imagen(noticia, slug):
         ext, data = svg_fallback(noticia["title_en"], noticia.get("topic", "ai"))
         fname = f"{slug}.{ext}"
     return fname, data, f"{REPO_PATH_IMG}/{fname}"
+
 
 # ─────────────────────────────────────────────────────────────
 # 5. MARKDOWN
@@ -270,32 +287,42 @@ def slugify(t):
         t = t.lower().replace(a, b)
     return re.sub(r"\s+", "-", re.sub(r"[^a-z0-9\s-]", "", t)).strip("-")[:70]
 
+
 def yml_list(items):
     return "\n".join(f'  - "{i}"' for i in items)
+
 
 def md_noticia(n, fecha, img_path, lang):
     title  = n["title_en"]       if lang == "en" else n["title_es"]
     desc   = n["description_en"] if lang == "en" else n["description_es"]
-    btn    = f"Read in {n['source']}" if lang == "en" else f"Leer en {n['source']}"
+    btn    = "Read in " + n.get("source","") if lang == "en" else "Leer en " + n.get("source","")
     topic  = (n.get("topic") or "ai").lower()
     extras = [t.lower() for t in (n.get("extra_topics") or []) if t.lower() in ["ai","web3","quantum"]]
     topics = list(dict.fromkeys([topic] + extras))
     areas  = n.get("areas") or ["technology"]
     slug   = slugify(n["title_en"])
     base   = REPO_PATH_EN if lang == "en" else REPO_PATH_ES
-    img    = f"/{img_path.replace('static/','')}" if img_path else ""
-    return f"{base}/{fecha}-{slug}.md", (
-        title_safe = title.replace('"', "'")
-        f'title: "{title_safe}"'
-        f"date: {fecha}T00:00:00Z\ndraft: false\n"
-        f'description: "{desc[:200].replace(chr(34),chr(39))}"\n'
-        f"topics:\n{yml_list(topics)}\nareas:\n{yml_list(areas)}\n"
-        f'categories:\n  - "Radar"\nsource: "{n.get("source","")}"\n'
-        f'url_original: "{n.get("url","")}"\nbutton_label: "{btn}"\n'
-        img_line = f'image: "{img}"' if img else '# image: ""'
-        f"{img_line}\n---\n\n"
-        f"{desc}\n\n**{btn}:** [{n.get('source','')}]({n.get('url','')})\n"
+    img      = "/" + img_path.replace("static/", "") if img_path else ""
+    img_line = 'image: "' + img + '"' if img else '# image: ""'
+    content = (
+        "---\n"
+        f'title: "{title.replace(chr(34), chr(39))}"\n'
+        f"date: {fecha}T00:00:00Z\n"
+        "draft: false\n"
+        f'description: "{desc[:200].replace(chr(34), chr(39))}"\n'
+        f"topics:\n{yml_list(topics)}\n"
+        f"areas:\n{yml_list(areas)}\n"
+        'categories:\n  - "Radar"\n'
+        f'source: "{n.get("source", "")}"\n'
+        f'url_original: "{n.get("url", "")}"\n'
+        f'button_label: "{btn}"\n'
+        f"{img_line}\n"
+        "---\n\n"
+        f"{desc}\n\n"
+        f"**{btn}:** [{n.get('source','')}]({n.get('url','')})\n"
     )
+    return f"{base}/{fecha}-{slug}.md", content
+
 
 def md_articulo(art, fecha, img_path, lang):
     title  = art["title_en"]       if lang == "en" else art["title_es"]
@@ -304,18 +331,24 @@ def md_articulo(art, fecha, img_path, lang):
     topics = [t.lower() for t in (art.get("topics") or ["ai"]) if t.lower() in ["ai","web3","quantum"]]
     areas  = art.get("areas") or ["regulation"]
     base   = REPO_PATH_EN if lang == "en" else REPO_PATH_ES
-    img    = f"/{img_path.replace('static/','')}" if img_path else ""
-    return f"{base}/{fecha}-{art['slug']}.md", (
-        title_safe = title.replace('"', "'")
-        f'title: "{title_safe}"'
-        f"date: {fecha}T00:00:00Z\ndraft: false\n"
-        f'description: "{desc[:200].replace(chr(34),chr(39))}"\n'
-        f"topics:\n{yml_list(topics)}\nareas:\n{yml_list(areas)}\n"
-        f'categories:\n  - "Radar"\n  - "Opinion"\nauthor: "{OPINION_AUTHOR}"\n'
-        img_line = f'image: "{img}"' if img else '# image: ""'
-        f"{img_line}\n---\n\n"
+    img      = "/" + img_path.replace("static/", "") if img_path else ""
+    img_line = 'image: "' + img + '"' if img else '# image: ""'
+    content = (
+        "---\n"
+        f'title: "{title.replace(chr(34), chr(39))}"\n'
+        f"date: {fecha}T00:00:00Z\n"
+        "draft: false\n"
+        f'description: "{desc[:200].replace(chr(34), chr(39))}"\n'
+        f"topics:\n{yml_list(topics)}\n"
+        f"areas:\n{yml_list(areas)}\n"
+        'categories:\n  - "Radar"\n  - "Opinion"\n'
+        f'author: "{OPINION_AUTHOR}"\n'
+        f"{img_line}\n"
+        "---\n\n"
         f"{body}\n"
     )
+    return f"{base}/{fecha}-{art['slug']}.md", content
+
 
 # ─────────────────────────────────────────────────────────────
 # 6. CONSTRUIR FICHEROS
@@ -324,6 +357,7 @@ def md_articulo(art, fecha, img_path, lang):
 def construir_ficheros(noticias, articulo, fecha):
     txt, bin_ = [], []
     print("📄 Generando ficheros...")
+
     ext, art_data = svg_fallback(articulo["title_en"], "ai")
     art_img = f"{REPO_PATH_IMG}/{fecha}-opinion-{articulo['slug']}.{ext}"
     bin_.append((art_img, art_data))
@@ -331,6 +365,7 @@ def construir_ficheros(noticias, articulo, fecha):
         p, c = md_articulo(articulo, fecha, art_img, lang)
         txt.append((p, c))
         print(f"   ✓ Artículo [{lang.upper()}]")
+
     for n in noticias:
         slug = slugify(n["title_en"])
         _, data, img_path = preparar_imagen(n, f"{fecha}-{slug}")
@@ -339,8 +374,10 @@ def construir_ficheros(noticias, articulo, fecha):
             p, c = md_noticia(n, fecha, img_path, lang)
             txt.append((p, c))
         print(f"   ✓ {slug[:55]}")
+
     print(f"   Total: {len(txt)} .md + {len(bin_)} imágenes")
     return txt, bin_
+
 
 # ─────────────────────────────────────────────────────────────
 # 7. GITHUB
@@ -360,6 +397,7 @@ def push_github(txt, bin_, fecha):
             print(f"   + {path}")
         time.sleep(0.3)
     print(f"   ✓ Commit: «{msg}»")
+
 
 # ─────────────────────────────────────────────────────────────
 # 8. EMAIL
@@ -390,6 +428,7 @@ def enviar_email(noticias, articulo, fecha, publicado, coste):
                f'padding:9px 20px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none;">'
                f'Read full article →</a>'
                if publicado else '<em style="font-size:13px;color:#888;">Pending GitHub upload</em>')
+
     html = (
         '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
         '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
@@ -412,9 +451,9 @@ def enviar_email(noticias, articulo, fecha, publicado, coste):
         f'<a href="{HUGO_BASE_URL}" style="color:#bbb;">waiq.technology</a></p>'
         '</body></html>'
     )
-    status = "✓ Published" if publicado else "⏳ Preview"
+
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"#WAIQ Radar {fecha} [{status}] — {articulo['title_en'][:50]}"
+    msg["Subject"] = f"#WAIQ Radar {fecha} [{'✓ Published' if publicado else '⏳ Preview'}] — {articulo['title_en'][:50]}"
     msg["From"] = GMAIL_USER
     msg["To"]   = EMAIL_RECIPIENTS
     msg.attach(MIMEText(html, "html"))
@@ -422,6 +461,7 @@ def enviar_email(noticias, articulo, fecha, publicado, coste):
         s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         s.sendmail(GMAIL_USER, [r.strip() for r in EMAIL_RECIPIENTS.split(",")], msg.as_string())
     print("   ✓ Email enviado")
+
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
