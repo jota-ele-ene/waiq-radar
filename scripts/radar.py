@@ -50,6 +50,18 @@ def parse_args():
         "--output-dir", dest="output_dir", default=None,
         help="Directorio de salida para JSON y raw (sobreescribe OUTPUT_DIR)"
     )
+    parser.add_argument(
+        "--debug", action="store_true", default=False,
+        help="Pausa después de cada paso para depuración interactiva"
+    )
+    parser.add_argument(
+        "--step", choices=["search","write","json","build","github","email"],
+        help="Ejecutar únicamente una etapa del pipeline (útil para depurar)"
+    )
+    parser.add_argument(
+        "--raw", dest="raw_path", default=None,
+        help="Ruta a un JSON raw de Claude para reutilizar noticias (usa con --step write)"
+    )
     return parser.parse_args()
 
 
@@ -69,8 +81,11 @@ EMAIL_RECIPIENTS   = os.environ.get("EMAIL_RECIPIENTS", "")
 
 RADAR_MODE      = _args.mode      or os.environ.get("RADAR_MODE", "full").lower()
 RADAR_JSON_PATH = _args.json_path or os.environ.get("RADAR_JSON_PATH", "")
+RAW_PATH        = _args.raw_path
 OUTPUT_DIR      = _args.output_dir or os.environ.get("OUTPUT_DIR", ".")
 SAVE_RAW        = _args.save_raw  or bool(os.environ.get("SAVE_RAW_RESPONSES", ""))
+DEBUG           = _args.debug
+STEP            = _args.step
 
 MODEL_SEARCH = "claude-sonnet-4-6"
 MODEL_WRITE  = "claude-haiku-4-5-20251001"
@@ -101,105 +116,64 @@ WAIQ_CONTEXT = (
 
 # ─────────────────────────────────────────────────────────────
 # GUARDAR RESPUESTAS RAW DE CLAUDE
+# Se graba SIEMPRE en raw/ (independientemente de SAVE_RAW).
+# SAVE_RAW solo controla si se muestra el mensaje en consola.
 # ─────────────────────────────────────────────────────────────
 
 def guardar_raw(nombre: str, response, texto_extraido: str, fecha: str):
     """
-    Guarda la respuesta cruda de Claude en output/raw/FECHA_nombre.json
-    Incluye: todos los bloques de contenido, uso de tokens y texto extraído.
-    Solo se ejecuta si SAVE_RAW=True.
+    Graba la respuesta completa de Claude en output/raw/FECHA_nombre.json
+    SIEMPRE, para poder depurar fallos de parseo posteriores.
     """
-    if not SAVE_RAW:
-        return
-
     raw_dir = Path(OUTPUT_DIR) / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # Serializar los bloques de contenido (pueden ser text, tool_use, tool_result)
-    bloques = []
-    for b in response.content:
-        bloque = {"type": getattr(b, "type", "unknown")}
-        if hasattr(b, "text"):
-            bloque["text"] = b.text
-        if hasattr(b, "name"):
-            bloque["name"] = b.name
-        if hasattr(b, "input"):
-            bloque["input"] = b.input
-        if hasattr(b, "id"):
-            bloque["id"] = b.id
-        bloques.append(bloque)
+    # Serializar el objeto response completo (Pydantic → dict)
+    try:
+        response_dict = response.model_dump()
+    except AttributeError:
+        response_dict = {
+            "id":            getattr(response, "id", ""),
+            "type":          getattr(response, "type", ""),
+            "role":          getattr(response, "role", ""),
+            "model":         getattr(response, "model", ""),
+            "stop_reason":   getattr(response, "stop_reason", ""),
+            "stop_sequence": getattr(response, "stop_sequence", None),
+            "usage": {
+                "input_tokens":                getattr(response.usage, "input_tokens", 0),
+                "output_tokens":               getattr(response.usage, "output_tokens", 0),
+                "cache_read_input_tokens":     getattr(response.usage, "cache_read_input_tokens", 0),
+                "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
+            },
+            "content": [
+                {k: getattr(b, k, None) for k in ["type", "text", "id", "name", "input"]}
+                for b in response.content
+            ],
+        }
 
     payload = {
-        "nombre":    nombre,
-        "fecha":     fecha,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "model":     getattr(response, "model", ""),
-        "usage": {
-            "input_tokens":  getattr(response.usage, "input_tokens",  0),
-            "output_tokens": getattr(response.usage, "output_tokens", 0),
-            "cache_read":    getattr(response.usage, "cache_read_input_tokens",     0),
-            "cache_written": getattr(response.usage, "cache_creation_input_tokens", 0),
-        },
-        "stop_reason":   getattr(response, "stop_reason", ""),
-        "content_blocks": bloques,
-        "texto_extraido": texto_extraido,
+        "nombre":         nombre,
+        "fecha":          fecha,
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "response_raw":   response_dict,   # ← respuesta completa tal como llega
+        "texto_extraido": texto_extraido,  # ← texto ya concatenado para parsear
     }
 
     outfile = raw_dir / f"{fecha}_{nombre}.json"
     outfile.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"   💾 Raw guardado: {outfile}")
+
+    # Siempre guardamos la respuesta completa para poder inspeccionar
+    if SAVE_RAW or DEBUG:
+        print(f"   💾 Raw guardado: {outfile}")
+    # Si no SAVE_RAW ni DEBUG, se graba igualmente pero en silencio
 
 
 # ─────────────────────────────────────────────────────────────
 # PARSER JSON ROBUSTO
 # ─────────────────────────────────────────────────────────────
 
-def parse_json_robusto(text: str) -> dict:
-    text = text.strip().lstrip('\ufeff')
-    text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```\s*$', '', text).strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    start, end = text.find('{'), text.rfind('}')
-    if start != -1 and end > start:
-        candidate = text[start:end+1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            text = candidate
-
-    repaired = _reparar_newlines(text)
-    try:
-        return json.loads(repaired)
-    except json.JSONDecodeError:
-        pass
-
-    sin_trailing = re.sub(r',\s*([}\]])', r'\1', repaired)
-    try:
-        return json.loads(sin_trailing)
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        import json_repair
-        return json_repair.loads(text)
-    except (ImportError, Exception):
-        pass
-
-    try:
-        json.loads(repaired)
-    except json.JSONDecodeError as e:
-        s = max(0, e.pos - 80)
-        snippet = repr(repaired[s:e.pos+80])
-        raise ValueError(f"JSON inválido en pos {e.pos}: {e.msg}\nContexto: ...{snippet}...") from e
-    raise ValueError("JSON inválido — causa desconocida")
-
-
 def _reparar_newlines(text: str) -> str:
+    """Escapa saltos de línea/tabuladores literales dentro de strings JSON."""
     result, in_str, escaped = [], False, False
     for ch in text:
         if escaped:
@@ -213,6 +187,102 @@ def _reparar_newlines(text: str) -> str:
         if in_str and ch == '\t': result.append('\\t'); continue
         result.append(ch)
     return ''.join(result)
+
+
+def _extraer_objetos_array(text: str, key: str) -> dict | None:
+    """
+    Extrae objetos de un array JSON aunque falten comas entre ellos.
+    Usa json.JSONDecoder.raw_decode() para parsear objeto a objeto.
+    """
+    m = re.search(rf'"{key}"\s*:\s*\[', text)
+    if not m:
+        return None
+
+    objetos = []
+    decoder = json.JSONDecoder()
+    pos = m.end()  # justo después del '['
+
+    while pos < len(text):
+        # Saltar separadores: espacios, comas, saltos de línea
+        while pos < len(text) and text[pos] in ' \t\n\r,':
+            pos += 1
+
+        if pos >= len(text) or text[pos] == ']':
+            break
+        if text[pos] != '{':
+            break
+
+        try:
+            obj, end_pos = decoder.raw_decode(text, pos)
+            objetos.append(obj)
+            pos = end_pos
+        except json.JSONDecodeError:
+            # Objeto corrupto: saltar hasta el siguiente '{'
+            next_obj = text.find('\n    {', pos + 1)
+            if next_obj == -1:
+                break
+            pos = next_obj
+
+    return {key: objetos} if objetos else None
+
+
+def parse_json_robusto(text: str) -> dict:
+    text = text.strip().lstrip('\ufeff')
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```\s*$', '', text).strip()
+
+    # Intento 1: JSON limpio
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Intento 2: extraer entre primer { y último }
+    start, end = text.find('{'), text.rfind('}')
+    if start != -1 and end > start:
+        candidate = text[start:end+1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            text = candidate
+
+    # Intento 3: reparar newlines literales dentro de strings
+    repaired = _reparar_newlines(text)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Intento 4: eliminar trailing commas
+    sin_trailing = re.sub(r',\s*([}\]])', r'\1', repaired)
+    try:
+        return json.loads(sin_trailing)
+    except json.JSONDecodeError:
+        pass
+
+    # Intento 5: json_repair (si está instalado)
+    try:
+        import json_repair
+        resultado = json_repair.loads(text)
+        if isinstance(resultado, dict):
+            return resultado
+    except (ImportError, Exception):
+        pass
+
+    # Intento 6: extracción objeto a objeto (fallas de comas entre objetos)
+    resultado = _extraer_objetos_array(text, "noticias")
+    if resultado:
+        print(f"   ⚠ JSON roto — recuperados {len(resultado['noticias'])} objetos por extracción directa")
+        return resultado
+
+    # Sin más opciones: reportar con contexto
+    try:
+        json.loads(repaired)
+    except json.JSONDecodeError as e:
+        s = max(0, e.pos - 80)
+        snippet = repr(repaired[s:e.pos+80])
+        raise ValueError(f"JSON inválido en pos {e.pos}: {e.msg}\nContexto: ...{snippet}...") from e
+    raise ValueError("JSON inválido — causa desconocida")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -285,7 +355,7 @@ def buscar_noticias(client: anthropic.Anthropic, fecha: str) -> list[dict]:
 
     texto = "".join(b.text for b in resp.content if hasattr(b, "text"))
 
-    # ── GUARDAR RAW ──
+    # Grabar raw ANTES de parsear (siempre, para poder depurar)
     guardar_raw("buscar_noticias", resp, texto, fecha)
 
     noticias = parse_json_robusto(texto).get("noticias", [])
@@ -297,7 +367,31 @@ def buscar_noticias(client: anthropic.Anthropic, fecha: str) -> list[dict]:
 # 2. ARTÍCULO
 # ─────────────────────────────────────────────────────────────
 
+
+# wrapper que reintenta cuando el JSON devuelto está roto
+
+def generar_articulo_retries(client: anthropic.Anthropic, noticias: list[dict], fecha: str, max_retries: int = 2) -> dict:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return generar_articulo(client, noticias, fecha)
+        except Exception as e:
+            # si se generó un archivo de texto inválido, renombrarlo según intento
+            bad = Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido.txt"
+            if bad.exists():
+                bad.rename(Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido_{attempt}.txt")
+            print(f"   ⚠ intento {attempt} fallido: {e}")
+            if attempt >= max_retries:
+                print("   ❌ agotados los intentos de generación")
+                raise
+            print(f"   🔁 reintentando ({attempt+1}/{max_retries})...")
+            time.sleep(1)
+
+
 def generar_articulo(client: anthropic.Anthropic, noticias: list[dict], fecha: str) -> dict:
+    """Función original; utiliza un solo intento y lanza error si falla.
+    Se mantiene para compatibilidad interna."""
     print("✍️  Generando artículo (Haiku)...")
 
     refs = "\n".join(
@@ -313,10 +407,10 @@ def generar_articulo(client: anthropic.Anthropic, noticias: list[dict], fecha: s
         f"Tono analítico, crítico, perspectiva europea. Para juristas y directivos. "
         f"Usa subtítulos. Cita fuentes naturalmente.\n\n"
         f"Devuelve SOLO JSON sin backticks:\n"
-        f'{{\"title_en\":\"...\",\"title_es\":\"...\",\"slug\":\"slug-kebab\",'
-        f'\"description_en\":\"...\",\"description_es\":\"...\",'
-        f'\"tags_en\":[],\"tags_es\":[],\"areas\":[],\"topics\":[],'
-        f'\"body_en\":\"...markdown...\",\"body_es\":\"...markdown...\"}}'
+        f'{{"title_en":"...","title_es":"...","slug":"slug-kebab",'
+        f'"description_en":"...","description_es":"...",'
+        f'"tags_en":[],"tags_es":[],"areas":[],"topics":[],'
+        f'"body_en":"...markdown...","body_es":"...markdown..."}}'
     )
 
     resp = client.messages.create(
@@ -328,11 +422,17 @@ def generar_articulo(client: anthropic.Anthropic, noticias: list[dict], fecha: s
     registrar_coste("generar_articulo", MODEL_WRITE, resp.usage)
 
     texto = resp.content[0].text
-
-    # ── GUARDAR RAW ──
     guardar_raw("generar_articulo", resp, texto, fecha)
 
-    art = parse_json_robusto(texto)
+    try:
+        art = parse_json_robusto(texto)
+    except ValueError as e:
+        badfile = Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido.txt"
+        badfile.write_text(texto, encoding="utf-8")
+        print(f"   ⚠ Error parseando artículo: {e}")
+        print(f"     texto guardado en {badfile}")
+        raise
+
     print(f"   ✓ «{art['title_en']}»")
     return art
 
@@ -600,20 +700,67 @@ def enviar_email(noticias: list, articulo: dict, fecha: str, publicado: bool, co
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    # helper para pausa interactiva
+    def pause(msg: str = ""):
+        if DEBUG:
+            input(f"--- {msg} (ENTER para continuar) ---")
+
     print(f"\n🚀 WAIQ Radar [{RADAR_MODE.upper()}]")
-    if SAVE_RAW:
-        print(f"   💾 Guardando respuestas raw en {OUTPUT_DIR}/raw/")
+    print(f"   💾 Raw responses → {Path(OUTPUT_DIR) / 'raw'}/")
+    if DEBUG:
+        print("   🐞 modo DEBUG activado: se pausará tras cada etapa")
     print("=" * 55)
     fecha = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if STEP:
+        # ejecución de una única etapa según --step (para depurar)
+        if STEP == "search":
+            if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            noticias = buscar_noticias(client, fecha)
+            print(json.dumps(noticias, ensure_ascii=False, indent=2))
+        elif STEP == "write":
+            if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
+            # cargar noticias desde raw o JSON
+            if RAW_PATH:
+                print(f"📥 cargando raw de noticias desde {RAW_PATH}")
+                r = json.loads(Path(RAW_PATH).read_text(encoding="utf-8"))
+                texto = r.get("texto_extraido") or ""
+                if not texto:
+                    sys.exit("❌ raw proporcionado no contiene campo texto_extraido")
+                noticias = parse_json_robusto(texto).get("noticias", [])
+            else:
+                if not RADAR_JSON_PATH:
+                    sys.exit("❌ para la etapa 'write' se necesita --json o --raw")
+                noticias, _, _ = cargar_json(RADAR_JSON_PATH)
+            if not noticias:
+                sys.exit("⚠️  Sin noticias disponibles")
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            articulo = generar_articulo_retries(client, noticias, fecha)
+            print(json.dumps(articulo, ensure_ascii=False, indent=2))
+        elif STEP == "json":
+            # crear json intermedio si hay noticias y artículo en memoria
+            sys.exit("⚠ etapa 'json' no implementada de forma independiente")
+        elif STEP == "build":
+            sys.exit("⚠ etapa 'build' no implementada de forma independiente")
+        elif STEP == "github":
+            sys.exit("⚠ etapa 'github' no implementada de forma independiente")
+        elif STEP == "email":
+            sys.exit("⚠ etapa 'email' no implementada de forma independiente")
+        sys.exit()
 
     if RADAR_MODE == "fetch-only":
         if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
         client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         noticias = buscar_noticias(client, fecha)
         if not noticias: sys.exit("⚠️  Sin noticias")
-        articulo = generar_articulo(client, noticias, fecha)
+        pause("buscar_noticias completada")
+        articulo = generar_articulo_retries(client, noticias, fecha)
+        pause("generar_articulo completado")
         coste    = imprimir_resumen_costes()
+        pause("costes calculados")
         guardar_json(noticias, articulo, fecha)
+        pause("JSON guardado")
         enviar_email(noticias, articulo, fecha, publicado=False, coste=coste)
         print("✅ fetch-only completado")
 
@@ -621,9 +768,12 @@ def main():
         if not GITHUB_TOKEN:    sys.exit("❌ GITHUB_TOKEN requerido")
         if not RADAR_JSON_PATH: sys.exit("❌ --json o RADAR_JSON_PATH requerido")
         noticias, articulo, fecha = cargar_json(RADAR_JSON_PATH)
+        pause("JSON cargado para publicación")
         txt, bin_ = construir_ficheros(noticias, articulo, fecha)
+        pause("ficheros construidos")
         push_github(txt, bin_, fecha)
         coste = imprimir_resumen_costes()
+        pause("costes calculados")
         enviar_email(noticias, articulo, fecha, publicado=True, coste=coste)
         print(f"✅ publish-only completado · commit «Radar {fecha}»")
 
@@ -633,11 +783,17 @@ def main():
         client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         noticias = buscar_noticias(client, fecha)
         if not noticias: sys.exit("⚠️  Sin noticias")
-        articulo = generar_articulo(client, noticias, fecha)
+        pause("buscar_noticias completada")
+        articulo = generar_articulo_retries(client, noticias, fecha)
+        pause("generar_articulo completado")
         coste    = imprimir_resumen_costes()
+        pause("costes calculados")
         guardar_json(noticias, articulo, fecha)
+        pause("JSON guardado")
         txt, bin_ = construir_ficheros(noticias, articulo, fecha)
+        pause("ficheros construidos")
         push_github(txt, bin_, fecha)
+        pause("push a GitHub terminado")
         enviar_email(noticias, articulo, fecha, publicado=True, coste=coste)
         print(f"✅ Pipeline completo · {len(noticias)} noticias · commit «Radar {fecha}»")
 
