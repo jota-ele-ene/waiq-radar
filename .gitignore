@@ -1,2 +1,4 @@
 .env
 output/
+logs/
+__pycache__/

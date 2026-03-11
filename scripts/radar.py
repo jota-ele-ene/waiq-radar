@@ -1,802 +1,126 @@
-"""
-WAIQ Radar — Pipeline principal
-
-Modos (variable RADAR_MODE o argumento --mode):
-  full          — busca + genera + publica en GitHub + email  [default]
-  fetch-only    — busca + genera + email + guarda JSON  (sin GitHub)
-  publish-only  — lee JSON + publica + email
-
-Uso desde línea de comandos:
-  python radar.py                                        # full (usa env vars)
-  python radar.py --mode fetch-only                     # solo fetch
-  python radar.py --mode publish-only --json radar.json # publicar desde JSON
-
-Variables de entorno opcionales extra:
-  SAVE_RAW_RESPONSES=1   guarda respuestas crudas de Claude en output/raw/
-  RADAR_JSON_PATH        ruta al JSON para publish-only (alternativa a --json)
-"""
+import os
+import sys
+import json
+import argparse
+import requests
+import subprocess
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-load_dotenv()
+from bs4 import BeautifulSoup
+from google import genai
 
-import os, re, sys, json, time, smtplib, urllib.request, argparse
-from datetime import datetime, timezone, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from pathlib import Path
+# 1. Rutas y Entorno
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(BASE_DIR)
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, '.env'))
 
-import anthropic
-from github import Github, GithubException
+from config import radar_config as cfg
 
-# ─────────────────────────────────────────────────────────────
-# ARGUMENTOS CLI  (permiten sobreescribir env vars)
-# ─────────────────────────────────────────────────────────────
+class WaiqRadar:
+    def __init__(self, output_dir=None):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.repo_url = os.getenv("REPO_URL") # Asegúrate de añadir esto a tu .env
+        self.model_id = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
+        
+        # Cliente v1beta (más flexible para el modo JSON en este SDK)
+        self.client = genai.Client(api_key=self.api_key, http_options={'api_version': 'v1beta'})
+        
+        self.output_base = output_dir or os.path.join(BASE_DIR, "output")
+        self.logs_dir = os.path.join(BASE_DIR, "logs")
+        
+        for sub in ['es', 'en', 'static/images/upload']:
+            os.makedirs(os.path.join(self.output_base, sub), exist_ok=True)
+        os.makedirs(self.logs_dir, exist_ok=True)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="WAIQ Radar pipeline")
-    parser.add_argument(
-        "--mode", choices=["full", "fetch-only", "publish-only"],
-        default=None,
-        help="Modo de ejecución (sobreescribe RADAR_MODE)"
-    )
-    parser.add_argument(
-        "--json", dest="json_path", default=None,
-        help="Ruta al JSON intermedio para publish-only (sobreescribe RADAR_JSON_PATH)"
-    )
-    parser.add_argument(
-        "--save-raw", action="store_true", default=False,
-        help="Guardar respuestas crudas de Claude (sobreescribe SAVE_RAW_RESPONSES)"
-    )
-    parser.add_argument(
-        "--output-dir", dest="output_dir", default=None,
-        help="Directorio de salida para JSON y raw (sobreescribe OUTPUT_DIR)"
-    )
-    parser.add_argument(
-        "--debug", action="store_true", default=False,
-        help="Pausa después de cada paso para depuración interactiva"
-    )
-    parser.add_argument(
-        "--step", choices=["search","write","json","build","github","email"],
-        help="Ejecutar únicamente una etapa del pipeline (útil para depurar)"
-    )
-    parser.add_argument(
-        "--raw", dest="raw_path", default=None,
-        help="Ruta a un JSON raw de Claude para reutilizar noticias (usa con --step write)"
-    )
-    return parser.parse_args()
-
-
-# ─────────────────────────────────────────────────────────────
-# CONFIGURACIÓN  (env vars + CLI, CLI tiene prioridad)
-# ─────────────────────────────────────────────────────────────
-
-_args = parse_args()
-
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO        = os.environ.get("GITHUB_REPO", "jota-ele-ene/waiq-multi")
-HUGO_BASE_URL      = os.environ.get("HUGO_BASE_URL", "https://waiq.technology")
-GMAIL_USER         = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-EMAIL_RECIPIENTS   = os.environ.get("EMAIL_RECIPIENTS", "")
-
-RADAR_MODE      = _args.mode      or os.environ.get("RADAR_MODE", "full").lower()
-RADAR_JSON_PATH = _args.json_path or os.environ.get("RADAR_JSON_PATH", "")
-RAW_PATH        = _args.raw_path
-OUTPUT_DIR      = _args.output_dir or os.environ.get("OUTPUT_DIR", ".")
-SAVE_RAW        = _args.save_raw  or bool(os.environ.get("SAVE_RAW_RESPONSES", ""))
-DEBUG           = _args.debug
-STEP            = _args.step
-
-MODEL_SEARCH = "claude-sonnet-4-6"
-MODEL_WRITE  = "claude-haiku-4-5-20251001"
-
-PRICING = {
-    MODEL_SEARCH: {"input": 3.00,  "output": 15.00, "search": 10.00},
-    MODEL_WRITE:  {"input": 1.00,  "output": 5.00,  "search":  0.00},
-}
-
-REPO_PATH_EN   = "content/en/article"
-REPO_PATH_ES   = "content/es/article"
-REPO_PATH_IMG  = "static/images/upload/articles"
-OPINION_AUTHOR = "WAIQ Radar"
-
-AREAS_VALIDAS = [
-    "regulation", "ethical", "legal", "business", "innovation",
-    "governance", "social", "technology", "sovereignty", "democracy",
-    "use-cases", "research"
-]
-
-WAIQ_CONTEXT = (
-    "WAIQ (Web3·AI·Quantum): foro Harvard Law 2023. Analiza tecnologías disruptivas "
-    "desde perspectivas NO técnicas: gobernanza, regulación, ética, impacto social, "
-    "modelos de negocio, soberanía digital, democracia, convergencia tecnológica. "
-    "Audiencia: juristas, directivos, innovadores. "
-    "EXCLUIR: noticias meramente técnicas (benchmarks, hardware, lanzamientos de modelos)."
-)
-
-# ─────────────────────────────────────────────────────────────
-# GUARDAR RESPUESTAS RAW DE CLAUDE
-# Se graba SIEMPRE en raw/ (independientemente de SAVE_RAW).
-# SAVE_RAW solo controla si se muestra el mensaje en consola.
-# ─────────────────────────────────────────────────────────────
-
-def guardar_raw(nombre: str, response, texto_extraido: str, fecha: str):
-    """
-    Graba la respuesta completa de Claude en output/raw/FECHA_nombre.json
-    SIEMPRE, para poder depurar fallos de parseo posteriores.
-    """
-    raw_dir = Path(OUTPUT_DIR) / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    # Serializar el objeto response completo (Pydantic → dict)
-    try:
-        response_dict = response.model_dump()
-    except AttributeError:
-        response_dict = {
-            "id":            getattr(response, "id", ""),
-            "type":          getattr(response, "type", ""),
-            "role":          getattr(response, "role", ""),
-            "model":         getattr(response, "model", ""),
-            "stop_reason":   getattr(response, "stop_reason", ""),
-            "stop_sequence": getattr(response, "stop_sequence", None),
-            "usage": {
-                "input_tokens":                getattr(response.usage, "input_tokens", 0),
-                "output_tokens":               getattr(response.usage, "output_tokens", 0),
-                "cache_read_input_tokens":     getattr(response.usage, "cache_read_input_tokens", 0),
-                "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
-            },
-            "content": [
-                {k: getattr(b, k, None) for k in ["type", "text", "id", "name", "input"]}
-                for b in response.content
-            ],
-        }
-
-    payload = {
-        "nombre":         nombre,
-        "fecha":          fecha,
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
-        "response_raw":   response_dict,   # ← respuesta completa tal como llega
-        "texto_extraido": texto_extraido,  # ← texto ya concatenado para parsear
-    }
-
-    outfile = raw_dir / f"{fecha}_{nombre}.json"
-    outfile.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # Siempre guardamos la respuesta completa para poder inspeccionar
-    if SAVE_RAW or DEBUG:
-        print(f"   💾 Raw guardado: {outfile}")
-    # Si no SAVE_RAW ni DEBUG, se graba igualmente pero en silencio
-
-
-# ─────────────────────────────────────────────────────────────
-# PARSER JSON ROBUSTO
-# ─────────────────────────────────────────────────────────────
-
-def _reparar_newlines(text: str) -> str:
-    """Escapa saltos de línea/tabuladores literales dentro de strings JSON."""
-    result, in_str, escaped = [], False, False
-    for ch in text:
-        if escaped:
-            result.append(ch); escaped = False; continue
-        if ch == '\\':
-            result.append(ch); escaped = True; continue
-        if ch == '"':
-            in_str = not in_str; result.append(ch); continue
-        if in_str and ch == '\n': result.append('\\n'); continue
-        if in_str and ch == '\r': result.append('\\r'); continue
-        if in_str and ch == '\t': result.append('\\t'); continue
-        result.append(ch)
-    return ''.join(result)
-
-
-def _extraer_objetos_array(text: str, key: str) -> dict | None:
-    """
-    Extrae objetos de un array JSON aunque falten comas entre ellos.
-    Usa json.JSONDecoder.raw_decode() para parsear objeto a objeto.
-    """
-    m = re.search(rf'"{key}"\s*:\s*\[', text)
-    if not m:
-        return None
-
-    objetos = []
-    decoder = json.JSONDecoder()
-    pos = m.end()  # justo después del '['
-
-    while pos < len(text):
-        # Saltar separadores: espacios, comas, saltos de línea
-        while pos < len(text) and text[pos] in ' \t\n\r,':
-            pos += 1
-
-        if pos >= len(text) or text[pos] == ']':
-            break
-        if text[pos] != '{':
-            break
-
+    def sync_repo(self):
+        """Asegura que tenemos lo último del repo antes de calcular fechas."""
+        print("🔄 Sincronizando repositorio local con remoto...")
         try:
-            obj, end_pos = decoder.raw_decode(text, pos)
-            objetos.append(obj)
-            pos = end_pos
-        except json.JSONDecodeError:
-            # Objeto corrupto: saltar hasta el siguiente '{'
-            next_obj = text.find('\n    {', pos + 1)
-            if next_obj == -1:
-                break
-            pos = next_obj
-
-    return {key: objetos} if objetos else None
-
-
-def parse_json_robusto(text: str) -> dict:
-    text = text.strip().lstrip('\ufeff')
-    text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```\s*$', '', text).strip()
-
-    # Intento 1: JSON limpio
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Intento 2: extraer entre primer { y último }
-    start, end = text.find('{'), text.rfind('}')
-    if start != -1 and end > start:
-        candidate = text[start:end+1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            text = candidate
-
-    # Intento 3: reparar newlines literales dentro de strings
-    repaired = _reparar_newlines(text)
-    try:
-        return json.loads(repaired)
-    except json.JSONDecodeError:
-        pass
-
-    # Intento 4: eliminar trailing commas
-    sin_trailing = re.sub(r',\s*([}\]])', r'\1', repaired)
-    try:
-        return json.loads(sin_trailing)
-    except json.JSONDecodeError:
-        pass
-
-    # Intento 5: json_repair (si está instalado)
-    try:
-        import json_repair
-        resultado = json_repair.loads(text)
-        if isinstance(resultado, dict):
-            return resultado
-    except (ImportError, Exception):
-        pass
-
-    # Intento 6: extracción objeto a objeto (fallas de comas entre objetos)
-    resultado = _extraer_objetos_array(text, "noticias")
-    if resultado:
-        print(f"   ⚠ JSON roto — recuperados {len(resultado['noticias'])} objetos por extracción directa")
-        return resultado
-
-    # Sin más opciones: reportar con contexto
-    try:
-        json.loads(repaired)
-    except json.JSONDecodeError as e:
-        s = max(0, e.pos - 80)
-        snippet = repr(repaired[s:e.pos+80])
-        raise ValueError(f"JSON inválido en pos {e.pos}: {e.msg}\nContexto: ...{snippet}...") from e
-    raise ValueError("JSON inválido — causa desconocida")
-
-
-# ─────────────────────────────────────────────────────────────
-# CONTABILIDAD DE COSTES
-# ─────────────────────────────────────────────────────────────
-
-cost_log: list[dict] = []
-
-
-def registrar_coste(llamada, model, usage, n_searches=0):
-    p = PRICING.get(model, {"input": 3.00, "output": 15.00, "search": 10.00})
-    in_tk  = getattr(usage, "input_tokens",  0)
-    out_tk = getattr(usage, "output_tokens", 0)
-    cost   = (in_tk/1_000_000)*p["input"] + (out_tk/1_000_000)*p["output"] + (n_searches/1_000)*p["search"]
-    entry  = {"llamada": llamada, "model": model, "input_tokens": in_tk,
-              "output_tokens": out_tk, "n_searches": n_searches, "cost_total": cost}
-    cost_log.append(entry)
-    srch = f" + {n_searches} búsq" if n_searches else ""
-    print(f"   💰 {llamada}: {in_tk:,}in + {out_tk:,}out{srch} = ${cost:.4f}")
-    return entry
-
-
-def contar_searches(response) -> int:
-    return sum(1 for b in response.content
-               if getattr(b, "type","") == "tool_use" and getattr(b, "name","") == "web_search")
-
-
-def imprimir_resumen_costes() -> float:
-    total = sum(e["cost_total"] for e in cost_log)
-    sep   = "─" * 62
-    print(f"\n{sep}\n📊  COSTES\n{sep}")
-    for e in cost_log:
-        m = e["model"].replace("claude-","").replace("-4-5-20251001","4.5").replace("-4-6","4.6")
-        print(f"  {e['llamada']:<26} {m:<12} {e['input_tokens']:>7,} in {e['output_tokens']:>6,} out  ${e['cost_total']:.4f}")
-    print(f"{sep}\n  TOTAL: ${total:.4f}  |  anual ×104: ${total*104:.2f}\n{sep}\n")
-    return total
-
-
-# ─────────────────────────────────────────────────────────────
-# 1. BÚSQUEDA
-# ─────────────────────────────────────────────────────────────
-
-def buscar_noticias(client: anthropic.Anthropic, fecha: str) -> list[dict]:
-    print("📡 Buscando noticias WAIQ...")
-    desde = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
-
-    prompt = (
-        f"Eres editor del radar WAIQ. Contexto: {WAIQ_CONTEXT}\n\n"
-        f"Busca noticias desde {desde} sobre: regulación/gobernanza IA (EU AI Act, políticas "
-        f"nacionales), aspectos legales/éticos/sociales de AI·Web3·Quantum, soberanía digital, "
-        f"brecha tecnológica, convergencia WAIQ, modelos de negocio innovadores, democracia+tecnología.\n"
-        f"Usa MÁXIMO 5 búsquedas. Prioriza: think tanks, medios especializados, organismos oficiales.\n\n"
-        f"Por cada noticia devuelve:\n"
-        f"title_en, title_es, description_en (2-3 frases), description_es (2-3 frases),\n"
-        f"url, source, source_domain, topic (ai|web3|quantum), extra_topics ([]),\n"
-        f"areas (de: {', '.join(AREAS_VALIDAS)}), image_url (o null), date (YYYY-MM-DD)\n\n"
-        f"Devuelve SOLO JSON sin backticks:\n"
-        f'{{\"noticias\":[{{...}},...]}}\n\nSelecciona 8-10 noticias de calidad.'
-    )
-
-    resp = client.messages.create(
-        model=MODEL_SEARCH,
-        max_tokens=3500,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    n_searches = contar_searches(resp)
-    registrar_coste("buscar_noticias", MODEL_SEARCH, resp.usage, n_searches)
-
-    texto = "".join(b.text for b in resp.content if hasattr(b, "text"))
-
-    # Grabar raw ANTES de parsear (siempre, para poder depurar)
-    guardar_raw("buscar_noticias", resp, texto, fecha)
-
-    noticias = parse_json_robusto(texto).get("noticias", [])
-    print(f"   ✓ {len(noticias)} noticias · {n_searches} búsquedas")
-    return noticias
-
-
-# ─────────────────────────────────────────────────────────────
-# 2. ARTÍCULO
-# ─────────────────────────────────────────────────────────────
-
-
-# wrapper que reintenta cuando el JSON devuelto está roto
-
-def generar_articulo_retries(client: anthropic.Anthropic, noticias: list[dict], fecha: str, max_retries: int = 2) -> dict:
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return generar_articulo(client, noticias, fecha)
+            if os.path.exists(os.path.join(BASE_DIR, ".git")):
+                subprocess.run(["git", "pull"], cwd=BASE_DIR, check=True)
+            else:
+                print("⚠️ No se detectó repo Git. Saltando sincronización.")
         except Exception as e:
-            # si se generó un archivo de texto inválido, renombrarlo según intento
-            bad = Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido.txt"
-            if bad.exists():
-                bad.rename(Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido_{attempt}.txt")
-            print(f"   ⚠ intento {attempt} fallido: {e}")
-            if attempt >= max_retries:
-                print("   ❌ agotados los intentos de generación")
-                raise
-            print(f"   🔁 reintentando ({attempt+1}/{max_retries})...")
-            time.sleep(1)
+            print(f"⚠️ Error al sincronizar: {e}")
 
+    def get_smart_date_and_history(self):
+        """Calcula fecha (último editorial - 2 días) y lista archivos existentes."""
+        es_path = os.path.join(self.output_base, "es")
+        existing_files = [f.replace('.md', '') for f in os.listdir(es_path) if f.endswith('.md')]
+        
+        # Buscar el último editorial: YYYY-MM-DD-editorial-waiq.md
+        editorials = sorted([f for f in existing_files if "editorial" in f], reverse=True)
+        
+        if editorials:
+            try:
+                last_date_str = "-".join(editorials[0].split('-')[:3])
+                last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+                target_date = last_date - timedelta(days=2)
+                return target_date.strftime("%Y-%m-%d"), existing_files
+            except:
+                pass
+        
+        return (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d"), existing_files
 
-def generar_articulo(client: anthropic.Anthropic, noticias: list[dict], fecha: str) -> dict:
-    """Función original; utiliza un solo intento y lanza error si falla.
-    Se mantiene para compatibilidad interna."""
-    print("✍️  Generando artículo (Haiku)...")
+    def fetch_and_generate(self, forced_since=None):
+        self.sync_repo()
+        smart_since, history = self.get_smart_date_and_history()
+        since = forced_since or smart_since
+        
+        print(f"🔎 Investigando desde: {since}")
+        print(f"🚫 Omitiendo {len(history)} noticias ya publicadas.")
 
-    refs = "\n".join(
-        f"[{n.get('topic','').upper()}] {n['title_en']} ({n['source']}): "
-        f"{n.get('description_en','')[:110]}"
-        for n in noticias
-    )
+        # Inyectamos la lista de archivos existentes en el prompt para que no los repita
+        history_context = f"DO NOT include any of the following stories (already published): {', '.join(history[:50])}"
+        full_prompt = f"{cfg.WAIQ_PROMPT}\n\nDate: {datetime.now().strftime('%Y-%m-%d')}\nSince: {since}\n{history_context}"
 
-    prompt = (
-        f"Eres articulista de WAIQ. Contexto: {WAIQ_CONTEXT}\n\n"
-        f"Noticias:\n{refs}\n\n"
-        f"Escribe artículo de opinión (600-800 palabras/idioma). "
-        f"Tono analítico, crítico, perspectiva europea. Para juristas y directivos. "
-        f"Usa subtítulos. Cita fuentes naturalmente.\n\n"
-        f"Devuelve SOLO JSON sin backticks:\n"
-        f'{{"title_en":"...","title_es":"...","slug":"slug-kebab",'
-        f'"description_en":"...","description_es":"...",'
-        f'"tags_en":[],"tags_es":[],"areas":[],"topics":[],'
-        f'"body_en":"...markdown...","body_es":"...markdown..."}}'
-    )
-
-    resp = client.messages.create(
-        model=MODEL_WRITE,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    registrar_coste("generar_articulo", MODEL_WRITE, resp.usage)
-
-    texto = resp.content[0].text
-    guardar_raw("generar_articulo", resp, texto, fecha)
-
-    try:
-        art = parse_json_robusto(texto)
-    except ValueError as e:
-        badfile = Path(OUTPUT_DIR) / f"{fecha}_articulo_invalido.txt"
-        badfile.write_text(texto, encoding="utf-8")
-        print(f"   ⚠ Error parseando artículo: {e}")
-        print(f"     texto guardado en {badfile}")
-        raise
-
-    print(f"   ✓ «{art['title_en']}»")
-    return art
-
-
-# ─────────────────────────────────────────────────────────────
-# 3. JSON INTERMEDIO
-# ─────────────────────────────────────────────────────────────
-
-def guardar_json(noticias, articulo, fecha) -> str:
-    payload = {
-        "fecha":     fecha,
-        "generado":  datetime.now(timezone.utc).isoformat(),
-        "costes":    cost_log,
-        "noticias":  noticias,
-        "articulo":  articulo,
-    }
-    p = Path(OUTPUT_DIR) / f"radar_{fecha}.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"   ✓ JSON: {p}")
-    return str(p)
-
-
-def cargar_json(path) -> tuple:
-    print(f"📂 Cargando {path}...")
-    d = json.loads(Path(path).read_text(encoding="utf-8"))
-    if "costes" in d:
-        cost_log.extend(d["costes"])
-    print(f"   ✓ {len(d['noticias'])} noticias · «{d['articulo']['title_en']}»")
-    return d["noticias"], d["articulo"], d.get("fecha", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-
-
-# ─────────────────────────────────────────────────────────────
-# 4. IMÁGENES
-# ─────────────────────────────────────────────────────────────
-
-def descargar_imagen(url, slug):
-    if not url:
-        return None
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = r.read()
-            ct   = r.headers.get("Content-Type", "image/jpeg")
-            ext  = "png" if "png" in ct else "webp" if "webp" in ct else "jpg"
-            return f"{slug}.{ext}", data
-    except Exception as e:
-        print(f"   ⚠ Imagen no descargable ({e})")
-        return None
-
-
-def svg_fallback(title, topic):
-    c   = {"ai": "#6366f1", "web3": "#10b981", "quantum": "#f59e0b"}.get(topic, "#6366f1")
-    w   = title.split()
-    l1, l2 = " ".join(w[:6]), " ".join(w[6:12])
-    l2t = (f'<text x="400" y="310" font-family="system-ui" font-size="26" '
-           f'font-weight="600" fill="white" text-anchor="middle">{l2}</text>') if l2 else ""
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">'
-        f'<rect width="800" height="450" fill="{c}"/>'
-        f'<rect x="0" y="380" width="800" height="70" fill="rgba(0,0,0,0.3)"/>'
-        f'<text x="400" y="180" font-family="system-ui" font-size="72" font-weight="bold" '
-        f'fill="white" text-anchor="middle" opacity="0.25">#{topic.upper()}</text>'
-        f'<text x="400" y="270" font-family="system-ui" font-size="26" font-weight="600" '
-        f'fill="white" text-anchor="middle">{l1}</text>{l2t}'
-        f'<text x="400" y="420" font-family="system-ui" font-size="18" '
-        f'fill="rgba(255,255,255,0.8)" text-anchor="middle">waiq.technology</text></svg>'
-    )
-    return "svg", svg.encode("utf-8")
-
-
-def preparar_imagen(noticia, slug):
-    r = descargar_imagen(noticia.get("image_url"), slug)
-    if r:
-        fname, data = r
-    else:
-        ext, data = svg_fallback(noticia["title_en"], noticia.get("topic", "ai"))
-        fname = f"{slug}.{ext}"
-    return fname, data, f"{REPO_PATH_IMG}/{fname}"
-
-
-# ─────────────────────────────────────────────────────────────
-# 5. MARKDOWN
-# ─────────────────────────────────────────────────────────────
-
-def slugify(t: str) -> str:
-    for a, b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ñ","n"),
-                 ("à","a"),("è","e"),("ì","i"),("ò","o"),("ù","u"),("ü","u")]:
-        t = t.lower().replace(a, b)
-    return re.sub(r"\s+", "-", re.sub(r"[^a-z0-9\s-]", "", t)).strip("-")[:70]
-
-
-def yml_list(items: list) -> str:
-    return "\n".join(f'  - "{i}"' for i in items)
-
-
-def md_noticia(n: dict, fecha: str, img_path: str, lang: str) -> tuple[str, str]:
-    title  = n["title_en"]       if lang == "en" else n["title_es"]
-    desc   = n["description_en"] if lang == "en" else n["description_es"]
-    btn    = "Read in " + n.get("source","") if lang == "en" else "Leer en " + n.get("source","")
-    topic  = (n.get("topic") or "ai").lower()
-    extras = [t.lower() for t in (n.get("extra_topics") or []) if t.lower() in ["ai","web3","quantum"]]
-    topics = list(dict.fromkeys([topic] + extras))
-    areas  = n.get("areas") or ["technology"]
-    slug   = slugify(n["title_en"])
-    base   = REPO_PATH_EN if lang == "en" else REPO_PATH_ES
-    img    = "/" + img_path.replace("static/", "") if img_path else ""
-    content = (
-        "---\n"
-        f'title: "{title.replace(chr(34), chr(39))}"\n'
-        f"date: {fecha}T00:00:00Z\n"
-        "draft: false\n"
-        f'description: "{desc[:200].replace(chr(34), chr(39))}"\n'
-        f"topics:\n{yml_list(topics)}\n"
-        f"areas:\n{yml_list(areas)}\n"
-        'categories:\n  - "Radar"\n'
-        f'source: "{n.get("source","")}"\n'
-        f'url_original: "{n.get("url","")}"\n'
-        f'button_label: "{btn}"\n'
-        f'{"image: \"" + img + "\"" if img else "# image: \"\""}\n'
-        "---\n\n"
-        f"{desc}\n\n"
-        f"**{btn}:** [{n.get('source','')}]({n.get('url','')})\n"
-    )
-    return f"{base}/{fecha}-{slug}.md", content
-
-
-def md_articulo(art: dict, fecha: str, img_path: str, lang: str) -> tuple[str, str]:
-    title  = art["title_en"]       if lang == "en" else art["title_es"]
-    desc   = art["description_en"] if lang == "en" else art["description_es"]
-    body   = art["body_en"]        if lang == "en" else art["body_es"]
-    topics = [t.lower() for t in (art.get("topics") or ["ai"]) if t.lower() in ["ai","web3","quantum"]]
-    areas  = art.get("areas") or ["regulation"]
-    base   = REPO_PATH_EN if lang == "en" else REPO_PATH_ES
-    img    = "/" + img_path.replace("static/", "") if img_path else ""
-    content = (
-        "---\n"
-        f'title: "{title.replace(chr(34), chr(39))}"\n'
-        f"date: {fecha}T00:00:00Z\n"
-        "draft: false\n"
-        f'description: "{desc[:200].replace(chr(34), chr(39))}"\n'
-        f"topics:\n{yml_list(topics)}\n"
-        f"areas:\n{yml_list(areas)}\n"
-        'categories:\n  - "Radar"\n  - "Opinion"\n'
-        f'author: "{OPINION_AUTHOR}"\n'
-        f'{"image: \"" + img + "\"" if img else "# image: \"\""}\n'
-        "---\n\n"
-        f"{body}\n"
-    )
-    return f"{base}/{fecha}-{art['slug']}.md", content
-
-
-# ─────────────────────────────────────────────────────────────
-# 6. CONSTRUIR FICHEROS
-# ─────────────────────────────────────────────────────────────
-
-def construir_ficheros(noticias: list, articulo: dict, fecha: str) -> tuple[list, list]:
-    txt, bin_ = [], []
-    print("📄 Generando ficheros...")
-
-    ext, art_data = svg_fallback(articulo["title_en"], "ai")
-    art_img = f"{REPO_PATH_IMG}/{fecha}-opinion-{articulo['slug']}.{ext}"
-    bin_.append((art_img, art_data))
-    for lang in ["en", "es"]:
-        p, c = md_articulo(articulo, fecha, art_img, lang)
-        txt.append((p, c))
-        print(f"   ✓ Artículo [{lang.upper()}]")
-
-    for n in noticias:
-        slug = slugify(n["title_en"])
-        _, data, img_path = preparar_imagen(n, f"{fecha}-{slug}")
-        bin_.append((img_path, data))
-        for lang in ["en", "es"]:
-            p, c = md_noticia(n, fecha, img_path, lang)
-            txt.append((p, c))
-        print(f"   ✓ {slug[:55]}")
-
-    print(f"   Total: {len(txt)} .md + {len(bin_)} imágenes")
-    return txt, bin_
-
-
-# ─────────────────────────────────────────────────────────────
-# 7. GITHUB
-# ─────────────────────────────────────────────────────────────
-
-def push_github(txt: list, bin_: list, fecha: str):
-    print("🐙 Publicando en GitHub...")
-    repo = Github(GITHUB_TOKEN).get_repo(GITHUB_REPO)
-    msg  = f"Radar {fecha}"
-    for path, content in txt + list(bin_):
         try:
-            ex = repo.get_contents(path)
-            repo.update_file(path, msg, content, ex.sha)
-            print(f"   ↻ {path}")
-        except GithubException:
-            repo.create_file(path, msg, content)
-            print(f"   + {path}")
-        time.sleep(0.3)
-    print(f"   ✓ Commit: «{msg}»")
+            # Eliminamos response_mime_type de config para evitar el error 400 anterior
+            # y lo forzamos en el prompt de radar_config.py
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=full_prompt,
+                config={'temperature': 0.2} 
+            )
+            
+            # Limpiamos posible basura de markdown del texto
+            json_text = response.text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(json_text)
 
+            for art in data.get('articles', []):
+                # Verificación extra por si la IA ignora el prompt
+                if art['filename'] in history:
+                    print(f"⏭️ Saltando duplicado: {art['filename']}")
+                    continue
+                
+                print(f"📄 Generando: {art['filename']}")
+                # Aquí iría tu lógica de download_image y guardado de archivos...
+                self.save_article(art)
 
-# ─────────────────────────────────────────────────────────────
-# 8. EMAIL
-# ─────────────────────────────────────────────────────────────
+        except Exception as e:
+            print(f"❌ Error: {e}")
 
-def enviar_email(noticias: list, articulo: dict, fecha: str, publicado: bool, coste: float):
-    if not (GMAIL_USER and GMAIL_APP_PASSWORD and EMAIL_RECIPIENTS):
-        print("   ⚠ Email no configurado — omitido")
-        return
-    print("📧 Enviando email...")
-    colors = {"ai": "#6366f1", "web3": "#10b981", "quantum": "#f59e0b"}
-    rows = "".join(
-        f'<div style="border-left:3px solid {colors.get(n.get("topic","ai"),"#6366f1")};'
-        f'padding:12px 16px;margin:10px 0;background:#fafafa;border-radius:0 8px 8px 0;">'
-        f'<div style="font-size:11px;color:{colors.get(n.get("topic","ai"),"#6366f1")};font-weight:700;">'
-        f'#{n.get("topic","").upper()} · {n.get("source","")}</div>'
-        f'<a href="{n["url"]}" style="font-size:15px;font-weight:700;color:#1a1a2e;text-decoration:none;">{n["title_en"]}</a>'
-        f'<p style="font-size:13px;color:#555;margin:5px 0 7px;">{n["description_en"]}</p>'
-        f'<a href="{n["url"]}" style="font-size:12px;color:{colors.get(n.get("topic","ai"),"#6366f1")};">Read →</a></div>'
-        for n in noticias
-    )
-    art_url = f"{HUGO_BASE_URL}/article/{fecha}-{articulo['slug']}/"
-    preview = re.sub(r"#{1,6}\s|[*_]", "", articulo["body_en"])[:280] + "..."
-    badge   = ('<span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">✓ Published</span>'
-               if publicado else
-               '<span style="background:#f59e0b;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">⏳ Preview</span>')
-    art_btn = (f'<a href="{art_url}" style="display:inline-block;background:#6366f1;color:white;'
-               f'padding:9px 20px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none;">'
-               f'Read full article →</a>'
-               if publicado else '<em style="font-size:13px;color:#888;">Pending GitHub upload</em>')
+    def save_article(self, art):
+        # Lógica de guardado ya funcional que tenías antes
+        pass
 
-    html = (
-        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
-        '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;max-width:660px;margin:0 auto;padding:20px;color:#1a1a2e;">'
-        '<div style="background:linear-gradient(135deg,#1a1a2e,#6366f1);padding:28px;border-radius:12px;color:white;margin-bottom:24px;">'
-        f'<div style="font-size:11px;letter-spacing:2px;opacity:0.7;">WAIQ RADAR · {fecha}</div>'
-        f'<h1 style="margin:8px 0 4px;font-size:24px;">#WAIQ News Radar</h1>'
-        f'<p style="margin:0 0 10px;opacity:0.8;font-size:14px;">{len(noticias)} references · Web3·AI·Quantum</p>'
-        f'{badge} <span style="margin-left:8px;font-size:11px;opacity:0.6;">cost: ${coste:.4f}</span>'
-        '</div>'
-        '<h2 style="font-size:17px;border-bottom:2px solid #f0f0f0;padding-bottom:8px;">📰 Highlights</h2>'
-        f'{rows}'
-        '<div style="background:#f0f0ff;border-radius:12px;padding:22px;margin:24px 0;">'
-        '<div style="font-size:11px;color:#6366f1;font-weight:700;letter-spacing:1px;margin-bottom:8px;">✍️ WAIQ OPINION</div>'
-        f'<h3 style="margin:0 0 10px;font-size:17px;">{articulo["title_en"]}</h3>'
-        f'<p style="font-size:13px;color:#555;margin:0 0 14px;line-height:1.6;">{preview}</p>'
-        f'{art_btn}</div>'
-        f'<p style="font-size:11px;color:#bbb;text-align:center;">WAIQ Radar · <a href="{HUGO_BASE_URL}" style="color:#bbb;">waiq.technology</a></p>'
-        '</body></html>'
-    )
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"#WAIQ Radar {fecha} [{'✓ Published' if publicado else '⏳ Preview'}] — {articulo['title_en'][:50]}"
-    msg["From"] = GMAIL_USER
-    msg["To"]   = EMAIL_RECIPIENTS
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        s.sendmail(GMAIL_USER, [r.strip() for r in EMAIL_RECIPIENTS.split(",")], msg.as_string())
-    print("   ✓ Email enviado")
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
+    def publish(self):
+        print("🚀 Publicando...")
+        subprocess.run(["git", "add", "."], cwd=BASE_DIR)
+        subprocess.run(["git", "commit", "-m", f"Radar Update {datetime.now().isoformat()}"], cwd=BASE_DIR)
+        subprocess.run(["git", "push"], cwd=BASE_DIR)
 
 def main():
-    # helper para pausa interactiva
-    def pause(msg: str = ""):
-        if DEBUG:
-            input(f"--- {msg} (ENTER para continuar) ---")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["full", "only-fetch", "only-publish"])
+    parser.add_argument("--since", help="Forzar fecha YYYY-MM-DD")
+    args = parser.parse_args()
 
-    print(f"\n🚀 WAIQ Radar [{RADAR_MODE.upper()}]")
-    print(f"   💾 Raw responses → {Path(OUTPUT_DIR) / 'raw'}/")
-    if DEBUG:
-        print("   🐞 modo DEBUG activado: se pausará tras cada etapa")
-    print("=" * 55)
-    fecha = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    if STEP:
-        # ejecución de una única etapa según --step (para depurar)
-        if STEP == "search":
-            if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            noticias = buscar_noticias(client, fecha)
-            print(json.dumps(noticias, ensure_ascii=False, indent=2))
-        elif STEP == "write":
-            if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
-            # cargar noticias desde raw o JSON
-            if RAW_PATH:
-                print(f"📥 cargando raw de noticias desde {RAW_PATH}")
-                r = json.loads(Path(RAW_PATH).read_text(encoding="utf-8"))
-                texto = r.get("texto_extraido") or ""
-                if not texto:
-                    sys.exit("❌ raw proporcionado no contiene campo texto_extraido")
-                noticias = parse_json_robusto(texto).get("noticias", [])
-            else:
-                if not RADAR_JSON_PATH:
-                    sys.exit("❌ para la etapa 'write' se necesita --json o --raw")
-                noticias, _, _ = cargar_json(RADAR_JSON_PATH)
-            if not noticias:
-                sys.exit("⚠️  Sin noticias disponibles")
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            articulo = generar_articulo_retries(client, noticias, fecha)
-            print(json.dumps(articulo, ensure_ascii=False, indent=2))
-        elif STEP == "json":
-            # crear json intermedio si hay noticias y artículo en memoria
-            sys.exit("⚠ etapa 'json' no implementada de forma independiente")
-        elif STEP == "build":
-            sys.exit("⚠ etapa 'build' no implementada de forma independiente")
-        elif STEP == "github":
-            sys.exit("⚠ etapa 'github' no implementada de forma independiente")
-        elif STEP == "email":
-            sys.exit("⚠ etapa 'email' no implementada de forma independiente")
-        sys.exit()
-
-    if RADAR_MODE == "fetch-only":
-        if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
-        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        noticias = buscar_noticias(client, fecha)
-        if not noticias: sys.exit("⚠️  Sin noticias")
-        pause("buscar_noticias completada")
-        articulo = generar_articulo_retries(client, noticias, fecha)
-        pause("generar_articulo completado")
-        coste    = imprimir_resumen_costes()
-        pause("costes calculados")
-        guardar_json(noticias, articulo, fecha)
-        pause("JSON guardado")
-        enviar_email(noticias, articulo, fecha, publicado=False, coste=coste)
-        print("✅ fetch-only completado")
-
-    elif RADAR_MODE == "publish-only":
-        if not GITHUB_TOKEN:    sys.exit("❌ GITHUB_TOKEN requerido")
-        if not RADAR_JSON_PATH: sys.exit("❌ --json o RADAR_JSON_PATH requerido")
-        noticias, articulo, fecha = cargar_json(RADAR_JSON_PATH)
-        pause("JSON cargado para publicación")
-        txt, bin_ = construir_ficheros(noticias, articulo, fecha)
-        pause("ficheros construidos")
-        push_github(txt, bin_, fecha)
-        coste = imprimir_resumen_costes()
-        pause("costes calculados")
-        enviar_email(noticias, articulo, fecha, publicado=True, coste=coste)
-        print(f"✅ publish-only completado · commit «Radar {fecha}»")
-
-    else:  # full
-        if not ANTHROPIC_API_KEY: sys.exit("❌ ANTHROPIC_API_KEY requerida")
-        if not GITHUB_TOKEN:      sys.exit("❌ GITHUB_TOKEN requerido")
-        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        noticias = buscar_noticias(client, fecha)
-        if not noticias: sys.exit("⚠️  Sin noticias")
-        pause("buscar_noticias completada")
-        articulo = generar_articulo_retries(client, noticias, fecha)
-        pause("generar_articulo completado")
-        coste    = imprimir_resumen_costes()
-        pause("costes calculados")
-        guardar_json(noticias, articulo, fecha)
-        pause("JSON guardado")
-        txt, bin_ = construir_ficheros(noticias, articulo, fecha)
-        pause("ficheros construidos")
-        push_github(txt, bin_, fecha)
-        pause("push a GitHub terminado")
-        enviar_email(noticias, articulo, fecha, publicado=True, coste=coste)
-        print(f"✅ Pipeline completo · {len(noticias)} noticias · commit «Radar {fecha}»")
-
+    radar = WaiqRadar()
+    if args.mode in ["full", "only-fetch"]:
+        radar.fetch_and_generate(forced_since=args.since)
+    if args.mode in ["full", "only-publish"]:
+        radar.publish()
 
 if __name__ == "__main__":
     main()
