@@ -1,0 +1,157 @@
+# ============================================================
+# WAIQ Technology Radar - Configuración
+# ============================================================
+
+# --- General ---
+radar_name: "WAIQ Technology Radar"
+language: "es"  # Idioma principal del radar (es/en)
+date_format: "%d/%m/%Y"
+
+# --- LLM Provider ---
+# Proveedores soportados: openai, anthropic, google
+# El modelo se usa para: filtrado de noticias, redacción de resúmenes,
+# traducción ES/EN, y generación del artículo de opinión.
+llm:
+  provider: "openai"          # openai | anthropic | google
+  model: "gpt-4o"             # gpt-4o | claude-sonnet-4-20250514 | gemini-2.0-flash
+  temperature: 0.4            # Baja para más precisión, alta para más creatividad
+  max_tokens: 4096
+
+# --- Búsqueda Web ---
+# Proveedores soportados: serper, tavily, searxng
+search:
+  provider: "serper"          # serper | tavily | searxng
+  max_results_per_query: 8
+  recency_days: 2             # Solo noticias de los últimos N días
+
+  # Queries en inglés
+  queries_en:
+    - "AI regulation governance policy 2026"
+    - "Web3 blockchain regulation Europe"
+    - "quantum computing policy business impact"
+    - "technology convergence AI quantum blockchain"
+    - "digital sovereignty Europe"
+    - "AI ethics society impact"
+    - "EU AI Act enforcement"
+    - "post-quantum cryptography readiness"
+    - "tokenization regulation"
+    - "emerging technology governance"
+    - "Spain technology innovation"
+    - "AI democratic implications"
+    - "Web3 governance DAO legal"
+    - "quantum computing Europe investment"
+    - "AI new business models"
+    - "blockchain business model disruption"
+    - "quantum computing commercialization"
+    - "Web3 tokenization business opportunities"
+
+  # Queries en español
+  queries_es:
+    - "regulación inteligencia artificial España 2026"
+    - "Web3 blockchain regulación Europa"
+    - "computación cuántica soberanía tecnológica"
+    - "convergencia tecnológica IA cuántica"
+    - "ética tecnológica gobernanza"
+    - "nuevos modelos de negocio IA blockchain"
+
+# --- Filtrado WAIQ ---
+# Una noticia es relevante si cumple al menos 'min_criteria' de estos criterios
+filter:
+  min_criteria: 2
+  max_news: 8
+  criteria:
+    - "Covers Web3, AI, or Quantum from a NON-purely-technical perspective"
+    - "Addresses governance, regulation, ethics, social or economic impact"
+    - "Shows convergence between two or more WAIQ technologies (Web3, AI, Quantum)"
+    - "Has implications for technological competitiveness/sovereignty (especially Spain/Europe)"
+    - "Presents new business models, use cases, or commercial opportunities"
+    - "Raises debates about democracy, digital rights, or inclusion"
+
+# --- Ángulos Editoriales ---
+# El LLM elige dinámicamente el/los ángulos según las noticias del día
+editorial_angles:
+  - "Legal"
+  - "Regulatorio"
+  - "Impacto social"
+  - "Competitividad"
+  - "Soberanía tecnológica"
+  - "Convergencia de tecnologías"
+  - "Gobernanza"
+  - "Ética"
+  - "Democracia"
+  - "Nuevos modelos de negocio"
+
+# --- Contexto WAIQ (se inyecta en los prompts del LLM) ---
+waiq_context: |
+  WAIQ focuses on the convergence of Web3, AI, and Quantum Sciences as
+  revolutionary technologies. Content must address:
+  - Social prosperity and economic development impact
+  - Responsible regulatory frameworks
+  - Intellectual property protection
+  - Ethics: privacy, human rights, diversity, inclusion
+  - Opportunities vs. risks (the biggest risk is falling behind)
+  - Spain/Europe positioning in the "manufactured intelligence revolution"
+  - Technology convergence (WEF 3C framework: Combination, Convergence, Compounding)
+
+# --- Email ---
+email:
+  enabled: true
+  provider: "smtp"            # smtp | gmail_api
+  to: "hi@jln.bz"
+  from_name: "WAIQ Radar"
+
+  # Configuración SMTP (para Gmail: smtp.gmail.com:587 con App Password)
+  smtp:
+    host: "smtp.gmail.com"
+    port: 587
+    username: ""              # Tu email (ej: tu@gmail.com)
+    password: ""              # App Password de Gmail (NO tu contraseña normal)
+    # Para Gmail: Configuración > Seguridad > Verificación en 2 pasos > Contraseñas de aplicación
+
+  send_diagnostic: true       # Enviar segundo email con log de ejecución
+
+# --- Publicación en GitHub ---
+github:
+  enabled: true
+  repo: "jota-ele-ene/waiq-multi"
+  branch: "main"
+  commit_message_template: "Radar {date}"
+
+  # Rutas dentro del repo Hugo
+  paths:
+    article_es: "content/es/article"
+    article_en: "content/en/article"
+    images: "static/images/upload"
+
+  # Taxonomías Hugo
+  topics_map:
+    AI: "ai"
+    IA: "ai"
+    "Artificial Intelligence": "ai"
+    Web3: "web3"
+    Blockchain: "web3"
+    Tokenization: "web3"
+    DeFi: "web3"
+    Quantum: "quantum"
+    PQC: "quantum"
+    "Post-Quantum": "quantum"
+
+  areas_list:
+    - business
+    - legal
+    - regulation
+    - innovation
+    - technology
+    - ethical
+    - ip
+
+# --- Verificación de URLs ---
+# Si true, hace fetch de cada URL seleccionada para verificar contenido
+# antes de redactar el resumen (más lento pero menos alucinaciones)
+verify_urls: true
+
+# --- Logging ---
+log:
+  level: "INFO"               # DEBUG | INFO | WARNING | ERROR
+  file: "logs/radar_{date}.log"
+  save_raw_results: true      # Guardar resultados brutos de búsqueda en logs/

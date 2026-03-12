@@ -1,5 +1,6 @@
 .env
-output/
 logs/
 __pycache__/
-repo_destino/
+*.pyc
+.venv/
+venv/

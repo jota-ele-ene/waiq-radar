@@ -1,0 +1,76 @@
+name: WAIQ Technology Radar
+
+on:
+  # Ejecución diaria a las 7:00 UTC (8:00 AM CET)
+  schedule:
+    - cron: '0 7 * * *'
+
+  # Ejecución manual desde la UI de GitHub
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no enviar email ni push)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      date:
+        description: 'Fecha forzada (YYYY-MM-DD, dejar vacío para hoy)'
+        required: false
+        default: ''
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout radar code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run WAIQ Radar
+        env:
+          # --- LLM ---
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          # --- Search ---
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          # TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+
+          # --- Email ---
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+          # --- GitHub (para push al repo waiq-multi) ---
+          GITHUB_TOKEN: ${{ secrets.WAIQ_GITHUB_TOKEN }}
+
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          python run.py $ARGS
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
