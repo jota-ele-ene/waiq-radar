@@ -264,6 +264,8 @@ def _write_article(
             lines.append(f'    title: "{_escape_yaml(ref.get("title", ""))}"')
     lines.append("---")
     path.write_text("\n".join(lines), encoding="utf-8")  # ← esto es lo que falta
+    if body:
+        path.write_text("\n".join(lines) + "\n\n" + body, encoding="utf-8")
 
 def _download_og_image(
     page_url: str,
