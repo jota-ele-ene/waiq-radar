@@ -3,7 +3,7 @@ name: WAIQ Technology Radar
 on:
   # Ejecución diaria a las 7:00 UTC (8:00 AM CET)
   schedule:
-    - cron: '0 7 * * *'
+  - cron: '0 7 * * 5'  
 
   # Ejecución manual desde la UI de GitHub
   workflow_dispatch:
@@ -42,6 +42,17 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Override LLM config
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+          # Sobreescribir solo si la variable está definida en el repo
+          [ -n "${{ vars.LLM_PROVIDER }}"      ] && yq -i '.llm.provider      = "${{ vars.LLM_PROVIDER }}"'      config.yaml
+          [ -n "${{ vars.LLM_MODEL }}"          ] && yq -i '.llm.model          = "${{ vars.LLM_MODEL }}"'          config.yaml
+          [ -n "${{ vars.LLM_MODEL_FILTER }}"   ] && yq -i '.llm.model_filter   = "${{ vars.LLM_MODEL_FILTER }}"'   config.yaml
 
       - name: Run WAIQ Radar
         env:

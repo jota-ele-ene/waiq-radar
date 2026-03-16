@@ -14,9 +14,9 @@ RETRY_BASE_DELAY = 20  # seconds
 
 
 class LLMClient:
-    def __init__(self, config: dict, tool_log: list):
+    def __init__(self, config: dict, tool_log: list, model_override: Optional[str] = None):
         self.provider = config["llm"]["provider"]
-        self.model = config["llm"]["model"]
+        self.model = model_override or config["llm"]["model"]  # usa override si existe
         self.temperature = config["llm"]["temperature"]
         self.max_tokens = config["llm"]["max_tokens"]
         self.api_key = config["llm"]["api_key"]
@@ -69,8 +69,6 @@ class LLMClient:
                 usage = f"tokens: {resp.usage.input_tokens}in/{resp.usage.output_tokens}out"
 
             elif self.provider == "google":
-                from google.genai import types
-
                 text, usage = self._google_generate(client, system_prompt, user_prompt)
 
             else:
@@ -116,7 +114,6 @@ class LLMClient:
                 )
                 text = resp.text
 
-                # Extract usage metadata if available
                 usage_meta = getattr(resp, "usage_metadata", None)
                 if usage_meta:
                     prompt_tokens = getattr(usage_meta, "prompt_token_count", "?")
@@ -142,14 +139,12 @@ class LLMClient:
                 else:
                     raise
 
-        # Should not reach here, but just in case
         raise last_error
 
     def complete_json(self, system_prompt: str, user_prompt: str, action_desc: str = "") -> dict:
         """Envía prompt y parsea la respuesta como JSON."""
         raw = self.complete(system_prompt, user_prompt + "\n\nRespond ONLY with valid JSON.", action_desc)
 
-        # Limpiar bloques de código markdown
         text = raw.strip()
         if text.startswith("```"):
             lines = text.split("\n")

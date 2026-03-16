@@ -12,17 +12,18 @@ date_format: "%d/%m/%Y"
 # El modelo se usa para: filtrado de noticias, redacción de resúmenes,
 # traducción ES/EN, y generación del artículo de opinión.
 llm:
-  provider: "google"          # openai | anthropic | google
-  model: "gemini-2.0-flash"             # gpt-4o | claude-sonnet-4-20250514 | gemini-2.0-flash
+  provider: "anthropic"          # openai | anthropic | google
+  model: "claude-sonnet-4-20250514"             # gpt-4o | claude-sonnet-4-20250514 | gemini-2.0-flash
+  model_filter: "claude-haiku-4-5-20251001"   # gpt-4o-mini | claude-haiku-4-5-20251001 |gemini-2.0-flash-lite
   temperature: 0.4            # Baja para más precisión, alta para más creatividad
   max_tokens: 4096
 
 # --- Búsqueda Web ---
 # Proveedores soportados: duckduckgo (sin API key), serper, tavily, searxng
 search:
-  provider: "searxng"           # tavily | serper | duckduckgo | searxng
-  max_results_per_query: 8
-  recency_days: 7             # Solo noticias de los últimos N días
+  provider: "tavily"           # tavily | serper | duckduckgo | searxng
+  max_results_per_query: 12
+  recency_days: 10             # Solo noticias de los últimos N días
 
   # Queries en inglés
   queries_en:
@@ -66,6 +67,7 @@ filter:
     - "Has implications for technological competitiveness/sovereignty (especially Spain/Europe)"
     - "Presents new business models, use cases, or commercial opportunities"
     - "Raises debates about democracy, digital rights, or inclusion"
+  api_contents: https://waiq.technology/api/contents/index.json
 
 # --- Ángulos Editoriales ---
 # El LLM elige dinámicamente el/los ángulos según las noticias del día

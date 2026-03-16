@@ -214,24 +214,21 @@ def _search_tavily(query: str, max_results: int, config: dict) -> List[SearchRes
 
 
 def _search_searxng(query: str, max_results: int, config: dict) -> List[SearchResult]:
-    """Búsqueda con instancia SearXNG """
+    """
+    Búsqueda con instancia SearXNG — paridad con Tavily search_depth: advanced.
+    Hace DOS llamadas (general + news) y fusiona, igual que Tavily combina fuentes.
+    """
     raw_base_url = config["search"].get("api_key", "")
     logger.info(f"[SearXNG] raw_base_url desde config.search.api_key = '{raw_base_url}'")
 
     base_url = raw_base_url.strip()
     if not base_url:
         raise ValueError("[SearXNG] base_url vacío. Revisa config.search.api_key")
-
     if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        logger.warning(f"[SearXNG] base_url sin protocolo: '{base_url}'")
-        # Opcional: podrías intentar añadir https:// automáticamente
-        # base_url = "https://" + base_url
         raise ValueError(f"[SearXNG] base_url inválido: '{base_url}'. Debe empezar por http:// o https://")
-
     base_url = base_url.rstrip("/")
-    full_url = f"{base_url}/search"
-    logger.info(f"[SearXNG] Usando URL de búsqueda: {full_url}")
 
+    # ── Mapeo recency_days → time_range (igual que DuckDuckGo y Tavily usan "days") ──
     recency = config["search"].get("recency_days", 7)
     if recency <= 1:
         time_range = "day"
@@ -240,27 +237,88 @@ def _search_searxng(query: str, max_results: int, config: dict) -> List[SearchRe
     else:
         time_range = "month"
 
-    resp = httpx.get(
-        f"{base_url}/search",
-        params={
-            "q": query,
-            "format": "json",
-            "categories": "general,news",
-            "time_range": time_range,
-            "language": "all",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    # ── Motores explícitos: esto es lo que marca la diferencia vs Tavily ──
+    # SearXNG sin engines explícitos delega en los defaults del servidor (a menudo solo DDG)
+    general_engines = "google,bing,brave,duckduckgo"
+    news_engines    = "google news,bing news,brave"
 
-    results = []
-    for item in data.get("results", [])[:max_results]:
-        results.append(SearchResult(
-            title=item.get("title", ""),
-            url=item.get("url", ""),
-            snippet=(item.get("content", "") or item.get("snippet", ""))[:500],
-            date=item.get("publishedDate", "") or item.get("published", ""),
-        ))
-    logger.info(f"[SearXNG] Query '{query}' devolvió {len(results)} resultados (antes de deduplicar)")
-    return results
+    seen_urls: set = set()
+    results: List[SearchResult] = []
+
+    def _fetch(categories: str, engines: str) -> List[SearchResult]:
+        """Llamada individual a la API JSON de SearXNG."""
+        try:
+            resp = httpx.get(
+                f"{base_url}/search",
+                params={
+                    "q":          query,
+                    "format":     "json",
+                    "categories": categories,
+                    "engines":    engines,
+                    "time_range": time_range,
+                    "language":   "auto",
+                    "pageno":     1,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            combined = data.get("results", [])
+
+            # Rescatar infoboxes (respuestas autoritativas que SearXNG segrega)
+            for box in data.get("infoboxes", []):
+                for url_entry in box.get("urls", []):
+                    combined.append({
+                        "title":         box.get("infobox", ""),
+                        "url":           url_entry.get("url", ""),
+                        "content":       box.get("content", ""),
+                        "publishedDate": "",
+                    })
+
+            return combined
+
+        except Exception as e:
+            logger.warning(f"[SearXNG] Llamada fallida (categories={categories}): {e}")
+            return []    
+    
+   
+    # ── Llamada 1: noticias recientes (equivale al topic:"news" de Tavily) ──
+    news_raw = _fetch("news", news_engines)
+    for item in news_raw:
+        url = item.get("url", "").strip()
+        snippet = (item.get("content", "") or item.get("snippet", "")).strip()
+        if url and url not in seen_urls and len(snippet) >= 50:
+            seen_urls.add(url)
+            results.append(SearchResult(
+                title=item.get("title", "").strip(),
+                url=url,
+                snippet=snippet[:500],
+                date=item.get("publishedDate", "") or item.get("published", ""),
+            ))
+
+    # ── Llamada 2: búsqueda general (cubre lo que Tavily llama search_depth:"advanced") ──
+    general_raw = _fetch("general", general_engines)
+    for item in general_raw:
+        url = item.get("url", "").strip()
+        snippet = (item.get("content", "") or item.get("snippet", "")).strip()
+        if url and url not in seen_urls and len(snippet) >= 50:
+            seen_urls.add(url)
+            results.append(SearchResult(
+                title=item.get("title", "").strip(),
+                url=url,
+                snippet=snippet[:500],
+                date=item.get("publishedDate", "") or item.get("published", ""),
+            ))
+
+    # ── Infoboxes: SearXNG a veces pone el mejor resultado aquí y el código original lo pierde ──
+    for raw in [news_raw, general_raw]:
+        # SearXNG devuelve infoboxes en data["infoboxes"], no en data["results"]
+        # pero por si algún motor lo mete en results con type="infobox":
+        pass  # ya cubierto arriba — ver nota sobre settings.yml más abajo
+
+    logger.info(
+        f"[SearXNG] '{query}' → {len(results)} únicos "
+        f"(news: {len(news_raw)}, general: {len(general_raw)})"
+    )
+    return results[:max_results * 2]  # mismo criterio que DuckDuckGo en el código original
