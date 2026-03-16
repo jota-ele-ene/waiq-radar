@@ -105,6 +105,35 @@ Respond as JSON: {{"angles": ["angle1", "angle2"], "rationale": "Brief explanati
 
 # ─── Funciones ────────────────────────────────────────────────────────────────
 
+def _build_results_table(results: List[SearchResult]) -> str:
+    lines = []
+    lines.append("| FUENTE | Fecha de publicación | URL |")
+    lines.append("| --- | --- | --- |")
+    for r in results:
+        fuente = getattr(r, "source", "") or "N/A"
+        fecha = getattr(r, "date", "") or "N/A"
+        url = r.url or "N/A"
+        fuente = str(fuente).replace("|", "\|")
+        fecha = str(fecha).replace("|", "\|")
+        url = str(url).replace("|", "\|")
+        lines.append(f"| {fuente} | {fecha} | {url} |")
+    return "\n".join(lines)
+
+
+def _build_filtered_table(news: List[dict]) -> str:
+    lines = []
+    lines.append("| FUENTE | Fecha de publicación | URL |")
+    lines.append("| --- | --- | --- |")
+    for item in news:
+        fuente = item.get("source", "N/A") or "N/A"
+        fecha = item.get("date", "N/A") or "N/A"
+        url = item.get("url", "N/A") or "N/A"
+        fuente = str(fuente).replace("|", "\|")
+        fecha = str(fecha).replace("|", "\|")
+        url = str(url).replace("|", "\|")
+        lines.append(f"| {fuente} | {fecha} | {url} |")
+    return "\n".join(lines)
+
 def filter_news(
     results: List[SearchResult],
     config: dict,
@@ -119,7 +148,16 @@ def filter_news(
 
     results_text = ""
     for i, r in enumerate(results):
-        results_text += f"\n[{i+1}] {r.title}\n    URL: {r.url}\n    Snippet: {r.snippet}\n    Date: {r.date}\n"
+        results_text += (
+            f"\n[{i+1}] {r.title}\n"
+            f"    URL: {r.url}\n"
+            f"    Snippet: {r.snippet}\n"
+            f"    Date: {r.date}\n"
+        )
+
+    # Tabla Markdown con las noticias de entrada (solo log)
+    input_table = _build_results_table(results)
+    logger.info("TABLA DE NOTICIAS DE ENTRADA:\n%s", input_table)
 
     user_prompt = FILTER_USER.format(
         count=len(results),
@@ -138,7 +176,13 @@ def filter_news(
         action_desc=f"Filtrar {len(results)} resultados → top {config['filter']['max_news']}",
     )
 
-    return data.get("news", [])
+    news = data.get("news", [])
+
+    # Tabla Markdown con las noticias filtradas (solo log)
+    filtered_table = _build_filtered_table(news)
+    logger.info("TABLA DE NOTICIAS FILTRADAS:\n%s", filtered_table)
+
+    return news
 
 
 def verify_news_urls(

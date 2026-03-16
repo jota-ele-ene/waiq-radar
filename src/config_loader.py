@@ -46,6 +46,8 @@ def _get_llm_key(provider: str) -> str:
 
 
 def _get_search_key(provider: str) -> str:
+    if provider == "duckduckgo":
+        return ""  # DuckDuckGo no requiere API key
     keys = {
         "serper": "SERPER_API_KEY",
         "tavily": "TAVILY_API_KEY",

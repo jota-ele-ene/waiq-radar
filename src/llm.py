@@ -1,12 +1,16 @@
 """
-Abstracción del LLM. Soporta OpenAI, Anthropic y Google Gemini.
+Abstracción del LLM. Soporta OpenAI, Anthropic y Google Gemini (google-genai SDK).
 """
 
 import json
 import logging
+import time
 from typing import List, Dict, Optional
 
 logger = logging.getLogger("waiq-radar.llm")
+
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 20  # seconds
 
 
 class LLMClient:
@@ -30,9 +34,8 @@ class LLMClient:
             import anthropic
             self._client = anthropic.Anthropic(api_key=self.api_key)
         elif self.provider == "google":
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self._client = genai
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
         return self._client
 
     def complete(self, system_prompt: str, user_prompt: str, action_desc: str = "") -> str:
@@ -66,14 +69,9 @@ class LLMClient:
                 usage = f"tokens: {resp.usage.input_tokens}in/{resp.usage.output_tokens}out"
 
             elif self.provider == "google":
-                model = client.GenerativeModel(self.model)
-                full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
-                resp = model.generate_content(
-                    full_prompt,
-                    generation_config={"temperature": self.temperature, "max_output_tokens": self.max_tokens},
-                )
-                text = resp.text
-                usage = "tokens: N/A (Gemini)"
+                from google.genai import types
+
+                text, usage = self._google_generate(client, system_prompt, user_prompt)
 
             else:
                 raise ValueError(f"Proveedor LLM no soportado: {self.provider}")
@@ -97,6 +95,55 @@ class LLMClient:
                 "result": f"ERROR — {str(e)}",
             })
             raise
+
+    def _google_generate(self, client, system_prompt: str, user_prompt: str):
+        """Google Gemini call with retry logic for 429 rate-limit errors."""
+        from google.genai import types
+
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=self.temperature,
+            max_output_tokens=self.max_tokens,
+        )
+
+        last_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=config,
+                )
+                text = resp.text
+
+                # Extract usage metadata if available
+                usage_meta = getattr(resp, "usage_metadata", None)
+                if usage_meta:
+                    prompt_tokens = getattr(usage_meta, "prompt_token_count", "?")
+                    output_tokens = getattr(usage_meta, "candidates_token_count", "?")
+                    usage = f"tokens: {prompt_tokens}in/{output_tokens}out"
+                else:
+                    usage = "tokens: N/A (Gemini)"
+
+                return text, usage
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                is_rate_limit = "429" in str(e) or "resource_exhausted" in error_str or "rate" in error_str
+
+                if is_rate_limit and attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Rate limit hit (attempt {attempt}/{MAX_RETRIES}). "
+                        f"Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+
+        # Should not reach here, but just in case
+        raise last_error
 
     def complete_json(self, system_prompt: str, user_prompt: str, action_desc: str = "") -> dict:
         """Envía prompt y parsea la respuesta como JSON."""

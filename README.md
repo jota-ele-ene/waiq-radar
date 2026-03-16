@@ -17,17 +17,26 @@ waiq-radar/
 ├── .env.example                 # Variables de entorno (API keys)
 ├── .gitignore
 ├── requirements.txt             # Dependencias Python
-├── run.py                       # Script principal (punto de entrada)
+├── run.py                       # Script principal (pipeline por fases)
 ├── README.md                    # Esta guía
 │
 ├── src/
 │   ├── __init__.py
 │   ├── config_loader.py         # Carga config.yaml + .env
-│   ├── search.py                # Búsqueda web (Serper/Tavily/SearXNG)
+│   ├── search.py                # Búsqueda web (DuckDuckGo/Serper/Tavily/SearXNG)
 │   ├── llm.py                   # Abstracción LLM (OpenAI/Anthropic/Google)
 │   ├── filter_and_compose.py    # Filtrado WAIQ + redacción + artículo opinión
 │   ├── email_sender.py          # Envío de emails por SMTP
 │   └── publisher.py             # Publicación en GitHub (Hugo .md + imágenes)
+│
+├── data/                        # (generado) Datos intermedios por fecha
+│   └── 2026-03-13/
+│       ├── 1_search_results.json   # Resultados brutos de búsqueda
+│       ├── 2_filtered_news.json    # Noticias filtradas por el LLM
+│       ├── 3_verified_news.json    # Noticias verificadas contra URLs
+│       ├── 4_composed.json         # Ángulo + opinión + noticias finales
+│       ├── email_preview.txt       # (dry-run) Preview del email
+│       └── tool_log.json           # Log acumulado de herramientas
 │
 ├── .github/
 │   └── workflows/
@@ -35,8 +44,6 @@ waiq-radar/
 │
 └── logs/                        # (generado) Logs de cada ejecución
     ├── radar_2026-03-13.log
-    ├── raw_results_2026-03-13.json
-    ├── findings_2026-03-13.json
     └── tool_log_2026-03-13.json
 ```
 
@@ -48,7 +55,7 @@ waiq-radar/
 
 - Python 3.10+
 - Una API key de LLM (OpenAI, Anthropic o Google)
-- Una API key de búsqueda web (Serper o Tavily)
+- (Opcional) Una API key de búsqueda web — DuckDuckGo funciona sin key, o Serper/Tavily
 - Una cuenta de email con SMTP (Gmail con App Password es lo más sencillo)
 - Un token de GitHub con permisos `repo` (para publicar en waiq-multi)
 
@@ -80,6 +87,7 @@ pip install -r requirements.txt
 
 | Proveedor | Cómo obtenerla | Precio orientativo |
 |-----------|---------------|-------------------|
+| **DuckDuckGo** | No necesita API key (por defecto) | Gratis, sin límite oficial |
 | **Serper** | [serper.dev](https://serper.dev) — regístrate y obtén API key | 2.500 búsquedas gratis, luego ~$0.001/búsqueda |
 | **Tavily** | [tavily.com](https://tavily.com) — regístrate y obtén API key | 1.000 búsquedas gratis/mes |
 | **SearXNG** | Instancia propia ([docs](https://docs.searxng.org)) | Gratis (self-hosted) |
@@ -109,7 +117,7 @@ Edita `.env` con tus keys:
 
 ```env
 OPENAI_API_KEY=sk-proj-...
-SERPER_API_KEY=...
+# SERPER_API_KEY=...          # Solo si cambias search.provider a "serper"
 SMTP_USERNAME=tu@gmail.com
 SMTP_PASSWORD=abcdefghijklmnop
 GITHUB_TOKEN=ghp_...
@@ -120,24 +128,67 @@ GITHUB_TOKEN=ghp_...
 Abre `config.yaml` y verifica:
 
 - `llm.provider` y `llm.model` coinciden con tu API key
-- `search.provider` coincide con tu API key de búsqueda
+- `search.provider` — por defecto `duckduckgo` (sin API key). Cámbialo si prefieres Serper/Tavily
 - `email.to` es la dirección donde quieres recibir el radar
 - `github.repo` apunta a tu repositorio Hugo
 
-### Paso 5: Probar en modo dry-run
+### Paso 5: Probar fase a fase
+
+Lo recomendado es ejecutar fase por fase la primera vez:
 
 ```bash
-python run.py --dry-run
+# 1. Solo búsqueda (no consume LLM)
+python run.py --phase search
+# Revisa data/{fecha}/1_search_results.json
+
+# 2. Filtrado con LLM (lee los resultados de búsqueda)
+python run.py --phase filter
+# Revisa data/{fecha}/2_filtered_news.json
+
+# 3. Verificación de URLs (si verify_urls: true)
+python run.py --phase verify
+# Revisa data/{fecha}/3_verified_news.json
+
+# 4. Componer ángulo + artículo (LLM)
+python run.py --phase compose
+# Revisa data/{fecha}/4_composed.json
+
+# 5. Preview del email (dry-run)
+python run.py --phase email --dry-run
+# Revisa data/{fecha}/email_preview.txt
+
+# 6. Publicar en GitHub
+python run.py --phase publish
+
+# 7. Enviar diagnóstico
+python run.py --phase diagnostic
 ```
 
-Esto ejecutará búsquedas y generará contenido, pero **no enviará email ni pusheará a GitHub**. Revisa la salida en consola y los archivos en `logs/`:
+Combinar fases:
 
-- `logs/radar_YYYY-MM-DD.log` — log completo de la ejecución
-- `logs/raw_results_YYYY-MM-DD.json` — todos los resultados de búsqueda brutos
-- `logs/findings_YYYY-MM-DD.json` — noticias seleccionadas y ángulo editorial
-- `logs/tool_log_YYYY-MM-DD.json` — log de herramientas (lo que irá en el email de diagnóstico)
+```bash
+python run.py --phase search,filter         # Búsqueda + filtrado
+python run.py --phase compose-diagnostic    # Desde compose hasta el final
+python run.py                                # Pipeline completo
+python run.py --dry-run                      # Completo sin enviar/publicar
+```
 
-### Paso 6: Ejecución real
+### Paso 6: Datos intermedios
+
+Cada fase guarda su resultado en `data/{fecha}/` como JSON:
+
+| Archivo | Genera | Consume |
+|---------|--------|--------|
+| `1_search_results.json` | search | filter |
+| `2_filtered_news.json` | filter | verify, compose |
+| `3_verified_news.json` | verify | compose |
+| `4_composed.json` | compose | email, publish, diagnostic |
+| `email_preview.txt` | email (dry-run) | — |
+| `tool_log.json` | todas | diagnostic |
+
+Puedes **editar manualmente** cualquier JSON antes de ejecutar la siguiente fase. Por ejemplo, eliminar una noticia de `2_filtered_news.json` antes de ejecutar `--phase compose`.
+
+### Paso 7: Ejecución completa
 
 ```bash
 python run.py
@@ -198,7 +249,7 @@ Crea estos secrets (los mismos valores que en `.env`):
 | Secret name | Valor |
 |------------|-------|
 | `OPENAI_API_KEY` | Tu API key de OpenAI (o `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY`) |
-| `SERPER_API_KEY` | Tu API key de Serper (o `TAVILY_API_KEY`) |
+| `SERPER_API_KEY` | (Opcional) Solo si usas Serper en vez de DuckDuckGo |
 | `SMTP_USERNAME` | Tu email (ej: `tu@gmail.com`) |
 | `SMTP_PASSWORD` | App Password de Gmail |
 | `WAIQ_GITHUB_TOKEN` | Token de GitHub con scope `repo` |
@@ -242,50 +293,46 @@ El workflow se ejecutará automáticamente cada día a las 8:00 AM CET. Puedes v
 ## Flujo de ejecución detallado
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  run.py                                                  │
-├──────────────────────────────────────────────────────────┤
-│                                                          │
-│  1. BÚSQUEDA WEB                                         │
-│     └─ search.py → Serper/Tavily/SearXNG                │
-│        └─ ~24 queries (18 EN + 6 ES)                    │
-│        └─ ~100-200 resultados brutos                    │
-│                                                          │
-│  2. FILTRADO CON LLM                                     │
-│     └─ filter_and_compose.py → OpenAI/Anthropic/Gemini  │
-│        └─ 1 llamada LLM: filtrar → top 5-8 noticias    │
-│                                                          │
-│  2b. VERIFICACIÓN DE URLs (opcional)                     │
-│      └─ fetch cada URL → extraer contenido real         │
-│      └─ 1 llamada LLM por URL: verificar resumen       │
-│                                                          │
-│  3. ÁNGULO EDITORIAL                                     │
-│     └─ 1 llamada LLM: elegir ángulo(s) según noticias  │
-│                                                          │
-│  4. ARTÍCULO DE OPINIÓN                                  │
-│     └─ 1 llamada LLM: generar artículo ES/EN           │
-│                                                          │
-│  5. EMAIL PRINCIPAL                                      │
-│     └─ email_sender.py → SMTP                           │
-│                                                          │
-│  6. PUBLICACIÓN GITHUB                                   │
-│     └─ publisher.py → git clone + generate + push       │
-│        └─ 18 archivos .md (9 artículos × 2 idiomas)    │
-│        └─ N imágenes og:image descargadas               │
-│        └─ 1 commit + push                               │
-│                                                          │
-│  7. EMAIL DIAGNÓSTICO                                    │
-│     └─ email_sender.py → SMTP                           │
-│        └─ Log completo de todas las llamadas            │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│  run.py --phase search                                    │
+│  └─ search.py → Tavily/Serper/DuckDuckGo/SearXNG        │
+│     └─ ~24 queries (18 EN + 6 ES)                       │
+│     └─ → data/{fecha}/1_search_results.json             │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase filter                                    │
+│  └─ filter_and_compose.py → LLM                          │
+│     └─ Lee: 1_search_results.json                       │
+│     └─ → data/{fecha}/2_filtered_news.json              │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase verify  (opcional)                        │
+│  └─ fetch URLs + LLM verificación                        │
+│     └─ Lee: 2_filtered_news.json                        │
+│     └─ → data/{fecha}/3_verified_news.json              │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase compose                                   │
+│  └─ LLM: ángulo editorial + artículo opinión ES/EN      │
+│     └─ Lee: 3_verified o 2_filtered                      │
+│     └─ → data/{fecha}/4_composed.json                   │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase email                                     │
+│  └─ Lee: 4_composed.json → SMTP                          │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase publish                                   │
+│  └─ Lee: 4_composed.json → git clone + .md + push         │
+├───────────────────────────────────────────────────────────────┤
+│  run.py --phase diagnostic                                │
+│  └─ Lee: tool_log.json → SMTP                             │
+└───────────────────────────────────────────────────────────────┘
+
+Cada fase es independiente. Los datos intermedios en data/{fecha}/
+permiten reejecutar cualquier fase sin repetir las anteriores.
 ```
 
 ## Llamadas API por ejecución (estimación)
 
 | Componente | Llamadas | Coste estimado |
 |-----------|----------|---------------|
-| Búsqueda web (Serper) | ~24 | ~$0.024 |
+| Búsqueda web (DuckDuckGo) | ~24 | gratis |
 | LLM - Filtrado | 1 | ~$0.005-0.02 |
 | LLM - Verificación URLs | 5-8 | ~$0.01-0.05 |
 | LLM - Ángulo editorial | 1 | ~$0.002 |
@@ -328,7 +375,8 @@ Edita `config.yaml` → `github.repo` y las rutas en `github.paths`.
 
 | Problema | Solución |
 |----------|---------|
-| `401 Unauthorized` en búsqueda | Verifica `SERPER_API_KEY` o `TAVILY_API_KEY` en `.env` |
+| `401 Unauthorized` en búsqueda | Si usas Serper/Tavily, verifica la API key en `.env`. O cambia a `duckduckgo` (sin key) |
+| DDG devuelve pocos resultados | DuckDuckGo puede ser más restrictivo. Sube `max_results_per_query` o cambia a Serper |
 | `401` en LLM | Verifica la API key del proveedor en `.env` |
 | Email no llega | Verifica App Password de Gmail. Revisa la carpeta de spam |
 | Push a GitHub falla | Verifica `GITHUB_TOKEN` con scope `repo`. Comprueba que el repo existe |

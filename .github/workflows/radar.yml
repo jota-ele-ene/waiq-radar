@@ -20,6 +20,10 @@ on:
         description: 'Fecha forzada (YYYY-MM-DD, dejar vacío para hoy)'
         required: false
         default: ''
+      phase:
+        description: 'Fase(s): search, filter, verify, compose, email, publish, diagnostic (vacío = todas)'
+        required: false
+        default: ''
 
 jobs:
   radar:
@@ -42,13 +46,13 @@ jobs:
       - name: Run WAIQ Radar
         env:
           # --- LLM ---
-          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
           # --- Search ---
-          # SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
 
           # --- Email ---
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -65,6 +69,9 @@ jobs:
           if [ -n "${{ github.event.inputs.date }}" ]; then
             ARGS="$ARGS --date ${{ github.event.inputs.date }}"
           fi
+          if [ -n "${{ github.event.inputs.phase }}" ]; then
+            ARGS="$ARGS --phase ${{ github.event.inputs.phase }}"
+          fi
           python run.py $ARGS
 
       - name: Upload logs
@@ -72,5 +79,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: radar-logs-${{ github.run_id }}
-          path: logs/
+          path: |
+            logs/
+            data/
           retention-days: 30

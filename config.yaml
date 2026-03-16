@@ -12,17 +12,17 @@ date_format: "%d/%m/%Y"
 # El modelo se usa para: filtrado de noticias, redacción de resúmenes,
 # traducción ES/EN, y generación del artículo de opinión.
 llm:
-  provider: "anthropic"          # openai | anthropic | google
-  model: "claude-sonnet-4-20250514"   # gpt-4o | claude-sonnet-4-20250514 | gemini-2.0-flash
+  provider: "google"          # openai | anthropic | google
+  model: "gemini-2.0-flash"             # gpt-4o | claude-sonnet-4-20250514 | gemini-2.0-flash
   temperature: 0.4            # Baja para más precisión, alta para más creatividad
   max_tokens: 4096
 
 # --- Búsqueda Web ---
-# Proveedores soportados: serper, tavily, searxng
+# Proveedores soportados: duckduckgo (sin API key), serper, tavily, searxng
 search:
-  provider: "tavily"          # serper | tavily | searxng
+  provider: "searxng"           # tavily | serper | duckduckgo | searxng
   max_results_per_query: 8
-  recency_days: 30             # Solo noticias de los últimos N días
+  recency_days: 7             # Solo noticias de los últimos N días
 
   # Queries en inglés
   queries_en:
