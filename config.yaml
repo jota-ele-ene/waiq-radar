@@ -59,7 +59,7 @@ search:
 # Una noticia es relevante si cumple al menos 'min_criteria' de estos criterios
 filter:
   min_criteria: 2
-  max_news: 8
+  max_news: 15 # Máximo de noticias a seleccionar para el radar semanal (después de filtrar por criterios)
   criteria:
     - "Covers Web3, AI, or Quantum from a NON-purely-technical perspective"
     - "Addresses governance, regulation, ethics, social or economic impact"
