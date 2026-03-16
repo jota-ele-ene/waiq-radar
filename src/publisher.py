@@ -83,7 +83,7 @@ def publish_to_github(
             stats["images_ok"] += 1
         stats["images_total"] += 1
 
-        image_ref = f"/images/upload/{date_iso}-{slug}.jpg" if img_path else None
+        image_ref = f"/images/upload/{img_path.name}" if img_path else None
         item["image"] = image_ref 
 
         # ES
